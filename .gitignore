@@ -1,0 +1,26 @@
+# JetBrains IDEs (CLion, IntelliJ, etc.)
+idea/
+*.iws
+*.iml
+*.ipr
+# CMake build directories
+cmake-build-*/
+# Logs and temporary files
+*.log
+*.tmp
+# Generated files
+Makefile
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+# Exclude compiled object files and binaries
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+# Exclude crashlytics and debug settings
+crashlytics.properties
+crashlytics-build.properties
+# Editor-based HTTP Client requests
+idea/httpRequests/
