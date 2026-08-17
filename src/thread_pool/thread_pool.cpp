@@ -12,12 +12,13 @@
 #include <queue>
 #include <thread>
 
-
 ThreadPool::ThreadPool(int thread_num): thread_count(thread_num) {
     for (int i = 0; i < thread_num; i++) {
         threads.emplace_back(&ThreadPool::run, this);
     }
+    cb_thread = std::thread(&ThreadPool::cb_run, this);
 }
+
 ThreadPool::~ThreadPool() {
     join();
 }
@@ -30,7 +31,43 @@ void ThreadPool::join() {
             t.join();
         }
     }
+
+    cb_stop.store(true);
+    cb_condition_variable.notify_all();
+    if (cb_thread.joinable()) {
+        cb_thread.join();
+    }
 }
+
+void ThreadPool::enqueue_callback(std::function<void()> func) {
+    std::unique_lock<std::mutex> lock(cb_mutex);
+    cb_queue.emplace(std::move(func));
+    cb_condition_variable.notify_one();
+}
+
+void ThreadPool::cb_run() {
+    while (true) {
+        std::function<void()> func = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(cb_mutex);
+            cb_condition_variable.wait(lock, [this] { return !cb_queue.empty() || cb_stop.load(); });
+            if (cb_stop.load() && cb_queue.empty()) {
+                return;
+            }
+            func = std::move(cb_queue.front());
+            cb_queue.pop();
+        }
+
+        if (func) {
+            try {
+                func();
+            } catch (...) {
+                std::cerr << "Exception occurred\n" << std::endl;
+            }
+        }
+    }
+}
+
 void ThreadPool::run() {
     while (true) {
         std::function<void()> task = nullptr;
@@ -52,7 +89,7 @@ void ThreadPool::run() {
             try {
                 task();
             } catch (std::exception& e) {
-                std::cerr << "Exception occured\n" << e.what() << std::endl;
+                std::cerr << "Exception occurred\n" << e.what() << std::endl;
             }
         }
     }

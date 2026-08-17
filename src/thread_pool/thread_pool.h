@@ -58,7 +58,7 @@ public:
     template <typename F, typename ... Args, typename Callback>
     void put(Callback&& cb, F&& func, Args&&... args) {
         // 使用广义捕获，将参数按值（或移动）存储到 lambda 闭包中
-        auto task = [func = std::forward<F>(func),
+        auto task = [this, func = std::forward<F>(func),
                     ... args = std::forward<Args>(args),
                     cb = std::forward<Callback>(cb)]() mutable -> void {
             // 调用时，args... 是左值（因为它们是 lambda 的成员）
@@ -68,37 +68,68 @@ public:
             if constexpr(is_void_func_t<F, Args...>::value) {
                 try {
                     func(args...);
-                    cb(Result(nullptr));
+                    if (use_async_cb) {
+                        enqueue_callback([cb = std::move(cb)]() { cb(nullptr); });
+                    } else {
+                        cb(Result(nullptr));
+                    }
                 } catch (...) {
-                    cb(Result(nullptr, std::current_exception()));
+                    auto exception = std::current_exception();
+                    if (use_async_cb) {
+                        enqueue_callback([cb = std::move(cb), exception]() { cb(Result(nullptr, exception)); });
+                    } else {
+                        cb(Result(nullptr, exception));
+                    }
                 }
             } else {
                 try {
                     auto t = func(args...);
-                    cb(Result(t));
+                    if (use_async_cb) {
+                        enqueue_callback([cb = std::move(cb), t = std::move(t)]() { cb(Result(t)); });
+                    } else {
+                        cb(Result(t));
+                    }
                 } catch (...) {
-                    cb(Result(nullptr, std::current_exception()));
+                    auto exception = std::current_exception();
+                    if (use_async_cb) {
+                        enqueue_callback([cb = std::move(cb), exception]() { cb(Result(nullptr, exception)); });
+                    } else {
+                        cb(Result(nullptr, exception));
+                    }
+
                 }
             }
-
         };
 
         {
             std::lock_guard<std::mutex> lock(mutex);
-            tasks.push(std::move(task));   // 移动 lambda，避免拷贝
+            tasks.emplace(std::move(task));   // 移动 lambda，避免拷贝
         }
+        cv.notify_one();
     }
 
     void join();
 
-protected:
+private:
+    void enqueue_callback(std::function<void()> func);
+    void cb_run();
     void run();
+protected:
+
     std::atomic<bool> joined = false;
     std::atomic<int>                  thread_count{};
     std::vector<std::thread>          threads;
     std::queue<std::function<void()>> tasks;
     std::mutex                        mutex;
     std::condition_variable           cv;
+
+    std::thread cb_thread;
+    std::mutex cb_mutex;
+    std::condition_variable cb_condition_variable;
+    std::queue<std::function<void()>> cb_queue;
+    std::atomic<bool> cb_stop = false;
+
+    bool use_async_cb = true;
 };
 
 

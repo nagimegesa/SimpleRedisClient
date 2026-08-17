@@ -41,15 +41,23 @@ public:
 private:
     std::ostringstream stream_;
     LoggerWriter* writer_;
+    LogLevel level_;
 };
 
 class Logger {
 public:
     LogEntry log(LogLevel level, const char* file, int line);
     ~Logger();
+
+    void set_log_file(const char* file, bool create=true);
+    void set_log_level(LogLevel level);
+    LogLevel get_log_level() { return level_; }
+
+
     static Logger& getInstance();
 
 private:
+    LogLevel level_;
     Logger() = default;
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
