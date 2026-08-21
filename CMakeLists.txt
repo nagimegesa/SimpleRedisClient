@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 3.10)
 project(Demo)
 set(CMAKE_CXX_STANDARD 20)
 
+add_library(logger src/logger/logger.cpp)
+target_include_directories(logger PUBLIC src/logger)
+target_link_libraries(logger utils)
 
 add_library(
         socket
@@ -12,7 +15,9 @@ add_library(
 target_link_libraries(
         socket
         ws2_32   # 添加这一行
+        logger
 )
+
 target_include_directories(
         socket PUBLIC
         src/socket/
@@ -21,12 +26,11 @@ target_include_directories(
 add_library(utils INTERFACE)
 target_include_directories(utils INTERFACE src/utils)
 
-add_library(thread src/thread_pool/thread_pool.cpp)
+add_library(thread
+        src/thread_pool/thread_pool.cpp
+        src/thread_pool/lock/SpinLock.cpp
+)
 target_include_directories(thread PUBLIC src/thread_pool/)
-
-add_library(logger src/logger/logger.cpp)
-target_include_directories(logger PUBLIC src/logger)
-target_link_libraries(logger utils)
 
 add_executable(main src/main.cpp)
 

@@ -40,22 +40,24 @@ void ThreadPool::join() {
 }
 
 void ThreadPool::enqueue_callback(std::function<void()> func) {
-    std::unique_lock<std::mutex> lock(cb_mutex);
+    std::unique_lock lock(cb_mutex);
     cb_queue.emplace(std::move(func));
-    cb_condition_variable.notify_one();
+    // cb_condition_variable.notify_one();
 }
 
 void ThreadPool::cb_run() {
     while (true) {
         std::function<void()> func = nullptr;
         {
-            std::unique_lock<std::mutex> lock(cb_mutex);
-            cb_condition_variable.wait(lock, [this] { return !cb_queue.empty() || cb_stop.load(); });
+            std::unique_lock lock(cb_mutex);
+            // cb_condition_variable.wait(lock, [this] { return !cb_queue.empty() || cb_stop.load(); });
             if (cb_stop.load() && cb_queue.empty()) {
                 return;
             }
-            func = std::move(cb_queue.front());
-            cb_queue.pop();
+            if (!cb_queue.empty()) {
+                func = std::move(cb_queue.front());
+                cb_queue.pop();
+            }
         }
 
         if (func) {
@@ -72,17 +74,18 @@ void ThreadPool::run() {
     while (true) {
         std::function<void()> task = nullptr;
         {
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [this] {
-                return !tasks.empty() || joined.load();
-            });
+            std::unique_lock lock(mutex);
+            // cv.wait(lock, [this] {
+            //     return !tasks.empty() || joined.load();
+            // });
 
             if (joined.load() && tasks.empty()) {
                 break;
             }
-
-            task = std::move(tasks.front());
-            tasks.pop();
+            if (!tasks.empty()) {
+                task = std::move(tasks.front());
+                tasks.pop();
+            }
         }
 
         if (task) {

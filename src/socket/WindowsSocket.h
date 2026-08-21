@@ -17,7 +17,7 @@ class WindowsSocket : public ISocket {
     bool is_listening = false;
 
 public:
-    WindowsSocket() = default;
+    WindowsSocket();
 
     // 用于封装已接受的客户端套接字（由 accept 内部调用）
     explicit WindowsSocket(SOCKET s);
@@ -30,13 +30,15 @@ public:
 
     WindowsSocket& operator=(WindowsSocket&& other) noexcept;
 
-    virtual ~WindowsSocket() override;
+    ~WindowsSocket() override;
 
     // 绑定地址和端口（返回 true 表示成功）
     bool bind(const std::string& ip, unsigned short port) override;
 
     // 开始监听（backlog 默认 SOMAXCONN）
-    bool listen(int backlog = -1) override;
+    bool listen(int backlog) override;
+
+    bool connect(const char* ip, unsigned short port) override;
 
     // 接受连接，返回新的 WindowsSocket 对象（调用者负责 delete）
     std::shared_ptr<ISocket> accept() override;

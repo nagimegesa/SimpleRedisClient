@@ -83,7 +83,7 @@ LogEntry::LogEntry(LoggerWriter* writer, const char* file, int line, LogLevel le
     const char* level_str = (level == LogLevel::DEBUG) ? "[DEBUG]" :
                             (level == LogLevel::INFO) ? "[INFO]" :
                             (level == LogLevel::WARNING) ? "[WARNING]" :
-                            (level == LogLevel::ERROR) ? "[ERROR]" : "[DEBUG]";
+                            (level == LogLevel::ERR) ? "[ERROR]" : "[DEBUG]";
     stream_ << level_str << " ";
     
     // 3. 写文件名和行号（方便定位）

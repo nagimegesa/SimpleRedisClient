@@ -269,7 +269,7 @@ int main() {
     cout << "\n===== 性能基准 =====\n";
 
     // 1. 空任务，变化线程数
-    const int TASKS = 10000;
+    const int TASKS = 100000;
     for (int t : {1, 2, 4, 8, 16}) {
         bench_empty(t, TASKS);
     }
@@ -284,8 +284,8 @@ int main() {
     bench_io(8, 100, 5);
 
     // 4. 大压力
-    bench_empty(8, 100000);
-    bench_cpu(8, 100000, 100);
+    bench_empty(8, 1000000);
+    bench_cpu(8, 1000000, 100);
 
     // 5. 边界：线程多于任务
     cout << "\n[Bench] Edge: 8 threads, 3 tasks (CPU)" << endl;

@@ -15,6 +15,8 @@
 #include <vector>
 #include <thread>
 
+#include "lock/SpinLock.h"
+
 struct Result {
     std::any result;
     std::exception_ptr exception;
@@ -102,7 +104,7 @@ public:
         };
 
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::lock_guard lock(mutex);
             tasks.emplace(std::move(task));   // 移动 lambda，避免拷贝
         }
         cv.notify_one();
@@ -120,16 +122,18 @@ protected:
     std::atomic<int>                  thread_count{};
     std::vector<std::thread>          threads;
     std::queue<std::function<void()>> tasks;
-    std::mutex                        mutex;
+    SpinLock mutex;
+    // std::mutex                        mutex;
     std::condition_variable           cv;
 
     std::thread cb_thread;
-    std::mutex cb_mutex;
+    SpinLock cb_mutex;
+    // std::mutex cb_mutex;
     std::condition_variable cb_condition_variable;
     std::queue<std::function<void()>> cb_queue;
     std::atomic<bool> cb_stop = false;
 
-    bool use_async_cb = true;
+    bool use_async_cb = false;
 };
 
 

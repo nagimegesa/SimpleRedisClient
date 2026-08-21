@@ -16,7 +16,7 @@ public:
 
     static SocketManager &getInstance();
 
-    std::shared_ptr<ISocket> get_socket();
+    std::shared_ptr<ISocket> getSocket();
 
     ~SocketManager();
 };

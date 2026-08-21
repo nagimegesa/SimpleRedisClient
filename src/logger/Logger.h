@@ -9,7 +9,7 @@ class LoggerWriter;
 
 
 enum LogLevel {
-    DEBUG, INFO, WARNING, ERROR
+    DEBUG = 0, INFO, WARNING, ERR
 };
 
 // 日志条目类（每一条日志的“生命周期”）

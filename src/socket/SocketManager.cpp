@@ -6,8 +6,12 @@
 #include "SocketManager.h"
 
 #include "WindowsSocket.h"
+
+#include "Logger.h"
+
 #ifdef _WIN32
 
+#include <iostream>
 #include <mutex>
 #include <Windows.h>
 #include <winsock2.h>
@@ -21,14 +25,15 @@ static bool wsa_init() {
 
     err = WSAStartup(wVersionRequested, &wsaData);
     if (err != 0) {
-        printf("WSAStartup failed with error: %d\n", err);
+        // printf("%d\n", err);
+        LOG(ERR) << "WSAStartup failed with error: " << err;
         return false;
     }
 
     if (LOBYTE(wsaData.wVersion) != 2 || HIBYTE(wsaData.wVersion) != 2) {
         /* Tell the user that we could not find a usable */
         /* WinSock DLL.                                  */
-        printf("Could not find a usable version of Winsock.dll\n");
+        LOG(ERR) << "Could not find a usable version of Winsock.dll";
         WSACleanup();
         return false;
     }
@@ -45,7 +50,7 @@ SocketManager& SocketManager::getInstance() {
     return instance;
 }
 
-std::shared_ptr<ISocket> SocketManager::get_socket() {
+std::shared_ptr<ISocket> SocketManager::getSocket() {
 #ifdef _WIN32
     std::call_once(wsa_inited, []() {wsa_init();});
     return std::make_shared<WindowsSocket>();
