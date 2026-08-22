@@ -1,43 +1,58 @@
 cmake_minimum_required(VERSION 3.10)
 
+
+set(CMAKE_C_COMPILER /usr/bin/gcc-14 CACHE PATH "C compiler")
+set(CMAKE_CXX_COMPILER /usr/bin/g++-14 CACHE PATH "C++ compiler")
+
 project(Demo)
 set(CMAKE_CXX_STANDARD 20)
 
-add_library(logger src/logger/logger.cpp)
-target_include_directories(logger PUBLIC src/logger)
-target_link_libraries(logger utils)
+add_library(utils src/utils/logger/Logger.cpp)
+target_include_directories(utils PUBLIC src/utils)
+
+add_library(thread
+        src/utils/thread_pool/thread_pool.cpp
+        src/utils/thread_pool/lock/SpinLock.cpp
+)
+
+target_link_libraries(
+        thread
+        utils
+)
+
+if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+    target_link_libraries(thread pthread)
+endif()
+
+target_include_directories(thread PUBLIC src/utils/thread_pool/)
 
 add_library(
-        socket
-        src/socket/SocketManager.cpp
-        src/socket/WindowsSocket.cpp
+        net
+        src/net/socket/SocketManager.cpp
+        src/net/socket/WindowsSocket.cpp
+        src/net/socket/LinuxSocket.cpp
+        src/net/context/EpollContext.cpp
 )
+
 target_link_libraries(
-        socket
-        ws2_32   # 添加这一行
-        logger
+        net
+        utils
+        thread
 )
 
 target_include_directories(
-        socket PUBLIC
-        src/socket/
+        net PUBLIC
+        src/net/
 )
 
-add_library(utils INTERFACE)
-target_include_directories(utils INTERFACE src/utils)
-
-add_library(thread
-        src/thread_pool/thread_pool.cpp
-        src/thread_pool/lock/SpinLock.cpp
-)
-target_include_directories(thread PUBLIC src/thread_pool/)
+if (CMAKE_SYSTEM_NAME MATCHES "Windows")
+    target_link_libraries(socket ws_sc2)
+endif()
 
 add_executable(main src/main.cpp)
-
 add_executable(test_thread_pool test/test_thread_pool_benchmark.cpp)
 add_executable(test_thread_pool_result test/test_thread_pool_result.cpp)
-
-target_link_libraries(main thread logger socket)
+target_link_libraries(main thread utils net)
 
 
 target_link_libraries(test_thread_pool thread)

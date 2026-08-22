@@ -17,7 +17,7 @@
 #include <iomanip>
 #include <functional>
 #include <cstdlib>
-#include "thread_pool/thread_pool.h"
+#include "thread_pool.h"
 
 using namespace std;
 using namespace chrono;

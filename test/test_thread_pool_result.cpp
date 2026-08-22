@@ -4,7 +4,7 @@
 
 #include <iostream>
 
-#include "thread_pool/thread_pool.h"
+#include "thread_pool.h"
 
 int add(int a, int b) {
     return a + b;
