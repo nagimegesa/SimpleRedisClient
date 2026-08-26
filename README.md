@@ -55,7 +55,7 @@ test/
 ### 编译 / Build
 
 ```bash
-cd /home/computer/project/Demo
+cd project-path
 
 # 以 Release 为例，Debug 与 RelWithDebInfo 同理
 cmake -S . -B cmake-build-release-wsl -DCMAKE_BUILD_TYPE=Release
@@ -87,7 +87,7 @@ redis> quit
 ### 运行测试与基准 / Run Tests & Benchmarks
 
 ```bash
-cd /home/computer/project/Demo
+cd project-path
 
 # 正确性测试
 ./cmake-build-debug-wsl/test_redis_acc
