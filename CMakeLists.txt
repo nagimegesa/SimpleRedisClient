@@ -61,7 +61,7 @@ add_executable(test_thread_pool test/test_thread_pool_benchmark.cpp)
 add_executable(test_thread_pool_result test/test_thread_pool_result.cpp)
 add_executable(test_redis_acc test/test_redis_parser.cpp)
 add_executable(test_redis_bench test/test_redis_bench.cpp)
-add_executable(test_redis_client_acc test/test_redis_client_acc.cpp)
+add_executable(test_redis_client_acc test/test_redis_client_bench.cpp)
 
 target_link_libraries(main thread utils net)
 target_link_libraries(redis_cli redis)

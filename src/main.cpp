@@ -10,7 +10,7 @@
 #include "context/EpollContext.h"
 #include "app/redis.h"
 
-// 异步读取回调函数（提取出来，使 main 更简洁）
+// 异步读取回调函数
 std::size_t onRedisResponse(const std::string& buf, int size) {
     std::size_t read_size = 0;
     try {
