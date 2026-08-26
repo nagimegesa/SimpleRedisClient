@@ -16,10 +16,10 @@ void SpinLock::lock() {
             return; // 成功获取锁
             }
 
-        // 2. 自旋退避循环 (不立即 yield)
+        // 2. 自旋退避循环
         for (int i = 0; i < (1 << std::min(backoff, 8)); ++i) {
 #if defined(__x86_64__) || defined(_M_X64)
-            _mm_pause(); // X86 暂停，省电且提高超线程性能
+            _mm_pause(); // X86 暂停
             // __asm__ volatile("nop");
 #elif defined(__arm__) || defined(__aarch64__)
             __asm__ volatile("yield" ::: "memory");
@@ -28,7 +28,7 @@ void SpinLock::lock() {
 #endif
         }
 
-        // 3. 如果自旋了多次还没拿到，再让步 (退避指数增长)
+        // 3. 如果自旋了多次还没拿到，再让步
         if (backoff < 16) backoff++;
         else std::this_thread::yield();
     }

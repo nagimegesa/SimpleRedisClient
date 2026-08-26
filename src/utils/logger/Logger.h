@@ -3,14 +3,12 @@
 
 // TODO: 这里可以使用无锁队列，但是太复杂，先不搞
 
-// 前向声明
 class LoggerWriter;
 
 enum LogLevel {
     DEBUG = 0, INFO, WARNING, ERR
 };
 
-// 日志条目类（每一条日志的“生命周期”）
 class LogEntry {
 public:
     // 构造时：立刻写入时间戳、日志级别、文件名行号
@@ -26,13 +24,11 @@ public:
         return *this;
     }
 
-    // 操纵符重载
     LogEntry& operator<<(std::ostream& (*manip)(std::ostream&)) {
         stream_ << manip;
         return *this;
     }
 
-    // 禁止拷贝（防止生命周期混乱）
     LogEntry(const LogEntry&) = delete;
     LogEntry& operator=(const LogEntry&) = delete;
 

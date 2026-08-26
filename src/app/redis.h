@@ -143,7 +143,7 @@ inline std::string buildRESPCommand(const std::vector<std::string>& args) {
     return cmd;
 }
 
-// 格式化 RESP 值为多行字符串（不使用 cout）
+// 格式化 RESP 值为多行字符串
 inline std::string formatResponse(const RESPValue& resp, int indent = 0) {
     std::ostringstream oss;
     std::string prefix(indent, ' ');

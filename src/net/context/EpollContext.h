@@ -66,7 +66,6 @@ struct SimpleBuffer {
         // 将剩余有效数据移到开头
         std::memmove(buffer.data(), buffer.data() + n, data_size_ - n);
         data_size_ -= n;
-        // 注意：不要改变 buffer.size()，保持原容量
     }
 };
 

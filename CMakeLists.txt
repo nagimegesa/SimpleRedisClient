@@ -1,13 +1,12 @@
 cmake_minimum_required(VERSION 3.10)
 
-
 set(CMAKE_C_COMPILER /usr/bin/gcc-14 CACHE PATH "C compiler")
 set(CMAKE_CXX_COMPILER /usr/bin/g++-14 CACHE PATH "C++ compiler")
 
 project(Demo)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)   # 强制使用 -std=c++20 而非 -std=gnu++20
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(utils src/utils/logger/Logger.cpp)
 target_include_directories(utils PUBLIC src/utils)

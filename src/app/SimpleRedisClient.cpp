@@ -17,7 +17,8 @@ struct RedisConnection {
 
     std::queue<std::shared_ptr<std::promise<RESPValue>>> promises;
 
-    SpinLock lock;
+    SpinLock lock; // 自旋锁比 mutex 好一点，但是不多
+    // std::mutex lock;
 
     RedisConnection() = default;
     RedisConnection(RedisConnection&&)  noexcept {}
