@@ -6,6 +6,9 @@
 #include "socket.h"
 
 #ifdef _WIN32
+
+static_assert(false, "The window socket is not finish");
+
 #include <winsock2.h>
 #include <Windows.h>
 

@@ -11,18 +11,19 @@
 #include "app/redis.h"
 
 // 异步读取回调函数（提取出来，使 main 更简洁）
-bool onRedisResponse(const std::string& buf) {
+std::size_t onRedisResponse(const std::string& buf, int size) {
+    std::size_t read_size = 0;
     try {
-        RESPValue result = RESP_Parser::parse(buf);
+        RESPValue result = RESP_Parser::parse(buf, read_size);
         std::cout << formatResponse(result) << std::flush;
     } catch (const IncompleteRESPException&) {
-        return false;
+        return read_size;
     } catch (const std::exception& e) {
         LOG(ERR) << "Parse error: " << e.what();
         LOG(ERR) << "Raw response: " << buf;
     }
 
-    return true;
+    return read_size;
 }
 
 int main() {

@@ -6,6 +6,7 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <memory>
 #include <string>
@@ -141,6 +142,10 @@ void LinuxSocket::setNoBlock() {
     }
     if (::fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         LOG(ERR) << "fcntl F_SETFL failed";
+    }
+    int enable = 1;
+    if (setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable)) < 0) {
+        LOG(ERR) <<"setsockopt TCP_NODELAY failed";
     }
 }
 

@@ -6,6 +6,8 @@ set(CMAKE_CXX_COMPILER /usr/bin/g++-14 CACHE PATH "C++ compiler")
 
 project(Demo)
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)   # 强制使用 -std=c++20 而非 -std=gnu++20
 
 add_library(utils src/utils/logger/Logger.cpp)
 target_include_directories(utils PUBLIC src/utils)
@@ -45,17 +47,30 @@ target_include_directories(
         src/net/
 )
 
+add_library(redis src/app/SimpleRedisClient.cpp)
+target_link_libraries(redis net)
+target_include_directories(redis PUBLIC src/app)
+
 if (CMAKE_SYSTEM_NAME MATCHES "Windows")
     target_link_libraries(socket ws_sc2)
 endif()
 
 add_executable(main src/main.cpp)
+add_executable(redis_cli src/redis_cli.cpp)
+
 add_executable(test_thread_pool test/test_thread_pool_benchmark.cpp)
 add_executable(test_thread_pool_result test/test_thread_pool_result.cpp)
-target_link_libraries(main thread utils net)
+add_executable(test_redis_acc test/test_redis_parser.cpp)
+add_executable(test_redis_bench test/test_redis_bench.cpp)
+add_executable(test_redis_client_acc test/test_redis_client_acc.cpp)
 
+target_link_libraries(main thread utils net)
+target_link_libraries(redis_cli redis)
 
 target_link_libraries(test_thread_pool thread)
 target_link_libraries(test_thread_pool_result thread)
+target_link_libraries(test_redis_acc redis)
+target_link_libraries(test_redis_client_acc redis)
+target_link_libraries(test_redis_bench redis)
 target_include_directories(test_thread_pool PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_include_directories(test_thread_pool_result PUBLIC ${PROJECT_SOURCE_DIR}/src)

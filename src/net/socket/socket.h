@@ -10,7 +10,7 @@
 class SocketManager;
 class EpollContext;
 
-using ReadContextCallBack = std::function<bool(const std::string&)>;
+using ReadContextCallBack = std::function<std::size_t(const std::string&, int size)>;
 using WriteContextCallBack = std::function<void(bool)>;
 
 class ISocket : public std::enable_shared_from_this<ISocket> {

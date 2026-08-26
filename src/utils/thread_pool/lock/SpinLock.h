@@ -1,10 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <new>
+
 class SpinLock {
 private:
-    // alignas(std::hardware_constructive_interference_size)
+    alignas(std::hardware_constructive_interference_size)
     std::atomic<bool> flag = false;
+    // char _[63];
 public:
     SpinLock() = default;
     SpinLock(const SpinLock&) = delete;

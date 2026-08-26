@@ -114,11 +114,11 @@ private:
     void cb_run();
     void run();
 protected:
-
     std::atomic<bool> joined = false;
     std::atomic<int>                  thread_count{};
     std::vector<std::thread>          threads;
     std::thread cb_thread;
+
 
     SpinBlockingQueue<std::function<void()>> tasks;
     SpinBlockingQueue<std::function<void()>> cb_tasks;

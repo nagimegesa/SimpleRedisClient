@@ -37,6 +37,10 @@ public:
 
 class RESP_Parser {
 public:
+    static RESPValue parse(const std::string& data, size_t& pos) {
+        return parse_value(data, pos);
+    }
+
     static RESPValue parse(const std::string& data) {
         size_t pos = 0;
         return parse_value(data, pos);

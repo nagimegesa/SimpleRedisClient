@@ -12,6 +12,7 @@ static_assert(false, "this context is only for linux");
 #endif
 
 #include "socket/socket.h"
+#include <cstring>
 class ISocket;
 
 #ifdef __linux__
@@ -27,6 +28,7 @@ public:
 
     void registerAsyncRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) const;
     void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback, const std::shared_ptr<std::string>& buf) const;
+    void close(const std::shared_ptr<ISocket>& socket) const;
     void run() const;
 
     ~EpollContext();
@@ -34,7 +36,7 @@ public:
 
 struct SimpleBuffer {
     std::string buffer;
-    int buffer_size;
+    int data_size_ = 0;
 
     void resize(size_t size) {
         buffer.resize(size);
@@ -49,11 +51,22 @@ struct SimpleBuffer {
     }
 
     int data_size() const {
-        return buffer_size;
+        return data_size_;
     }
 
     void clear() {
-        buffer.clear();
+        data_size_ = 0;
+    }
+
+    void read(std::size_t n) {
+        if (n >= static_cast<size_t>(data_size_)) {
+            clear();              // data_size_ = 0，不清空 buffer
+            return;
+        }
+        // 将剩余有效数据移到开头
+        std::memmove(buffer.data(), buffer.data() + n, data_size_ - n);
+        data_size_ -= n;
+        // 注意：不要改变 buffer.size()，保持原容量
     }
 };
 

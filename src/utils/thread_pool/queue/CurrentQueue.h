@@ -81,6 +81,7 @@ public:
 template <typename T>
 class SpinBlockingQueue : public IQueue<T> {
 private:
+    alignas(std::hardware_constructive_interference_size)
     std::queue<T> queue_;
     mutable SpinLock mutex_;
     bool stopped_ = false;  // 不需要 atomic，因为总在锁内操作
