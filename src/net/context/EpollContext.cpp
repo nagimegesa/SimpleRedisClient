@@ -16,6 +16,7 @@
 #include <sys/eventfd.h>
 
 #include "logger/Logger.h"
+#include "queue/LockFreeQueue.h"
 #include "socket/LinuxSocket.h"
 
 // 写元信息（原代码中的 WriteMetaInfo）
@@ -99,7 +100,7 @@ public:
     // 提交任务到本线程的事件循环（线程安全）
     void postTask(std::function<void()> task) {
         {
-            std::lock_guard<std::mutex> lock(task_mutex_);
+            // std::lock_guard<std::mutex> lock(task_mutex_);
             task_queue_.push(std::move(task));
         }
         // 唤醒 epoll_wait
@@ -143,14 +144,19 @@ private:
     }
 
     void drainTasks() {
-        std::queue<std::function<void()>> tasks;
-        {
-            std::lock_guard<std::mutex> lock(task_mutex_);
-            tasks.swap(task_queue_);
-        }
-        while (!tasks.empty()) {
-            tasks.front()();
-            tasks.pop();
+        // std::queue<std::function<void()>> tasks;
+        // {
+        //     std::lock_guard<std::mutex> lock(task_mutex_);
+        //     tasks.swap(task_queue_);
+        // }
+        // while (!tasks.empty()) {
+        //     tasks.front()();
+        //     tasks.pop();
+        // }
+
+        std::function<void()> task;
+        while (task_queue_.pop(task) || (!running_ && !task_queue_.empty())) {
+            task();
         }
     }
 
@@ -380,10 +386,11 @@ private:
     std::thread thread_;
 
     std::unordered_map<int, std::shared_ptr<Connection>> connections_; // 仅在事件循环线程访问
-    std::queue<std::function<void()>> task_queue_;                     // 待处理任务队列
-    std::mutex task_mutex_;                                            // 保护任务队列
+    // std::queue<std::function<void()>> task_queue_;                     // 待处理任务队列
+    // std::mutex task_mutex_;                                            // 保护任务队列
+    MPSCQueue<std::function<void()>, 4096> task_queue_;
 
-    constexpr static int MAX_EVENTS = 1024;
+    constexpr static int MAX_EVENTS = 2048;
 };
 
 // ------------------------- EpollContext::Impl -------------------------

@@ -5,10 +5,9 @@
 #ifndef DEMO_CURRENTQUEUE_H
 #define DEMO_CURRENTQUEUE_H
 #include <condition_variable>
-#include <memory>
 #include <queue>
 
-#include "lock/SpinLock.h"
+#include "thread_pool/lock/SpinLock.h"
 
 template <typename T>
 class IQueue {

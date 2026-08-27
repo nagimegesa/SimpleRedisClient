@@ -25,7 +25,7 @@ src/
   redis_cli.cpp SimpleRedisClient 版交互式客户端
 test/
   test_redis_bench.cpp          SET 压力测试，单连接 epoll 异步
-  test_redis_client_bench.cpp   pipeline 压力测试，SimpleRedisClient
+  test_redis_client_bench.cpp   pipeline 压力测试，SimpleRedisClient 
   test_redis_parser.cpp         RESP 解析与异步集成正确性测试
   test_thread_pool_benchmark.cpp 线程池正确性与性能基准
   test_thread_pool_result.cpp   线程池 Result 接口冒烟测试

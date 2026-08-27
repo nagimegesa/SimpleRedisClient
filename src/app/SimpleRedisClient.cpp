@@ -17,7 +17,7 @@ struct RedisConnection {
 
     std::queue<std::shared_ptr<std::promise<RESPValue>>> promises;
 
-    SpinLock lock; // 自旋锁比 mutex 好一点，但是不多
+    // SpinLock lock; // 自旋锁比 mutex 好一点，但是不多
     // std::mutex lock;
 
     RedisConnection() = default;
@@ -74,20 +74,31 @@ struct SimpleRedisClient::ClientImpl {
     std::shared_ptr<std::promise<RESPValue>> execute(std::string cmd) {
         int which_sock = std::hash<std::size_t>{}(++SimpleRedisClient::ClientImpl::counter) % clients.size();
         auto p = std::make_shared<std::promise<RESPValue>>();
-        {
-            std::lock_guard _(clients[which_sock].lock);
-            clients[which_sock].socket->asyncWriteOnce(*epollContext,
-                [p](bool success) {
-                    if (!success) {
-                        // TODO: 这里或许需要 把失败的 promises 删除。或者设置异常，但是没想好怎么写
-                        // TODO: 但是其实大部分情况下不会出现写错误，这里暂时忽略
-                        LOG(ERR) << "SimpleRedisClient::execute() failed";
-                        return;
-                    }
-                },
-                std::make_shared<std::string>(std::move(cmd)));
-            clients[which_sock].promises.push(p);
-        }
+        // {
+        //     std::lock_guard _(clients[which_sock].lock);
+        //     clients[which_sock].socket->asyncWriteOnce(*epollContext,
+        //         [p](bool success) {
+        //             if (!success) {
+        //                 // TODO: 这里或许需要 把失败的 promises 删除。或者设置异常，但是没想好怎么写
+        //                 // TODO: 但是其实大部分情况下不会出现写错误，这里暂时忽略
+        //                 LOG(ERR) << "SimpleRedisClient::execute() failed";
+        //                 return;
+        //             }
+        //         },
+        //         std::make_shared<std::string>(std::move(cmd)));
+        //     clients[which_sock].promises.push(p);
+        // }
+
+        clients[which_sock].socket->asyncWriteOnce(*epollContext,
+            [p, this, which_sock](bool success) {
+                if (!success) {
+                    LOG(ERR) << "SimpleRedisClient::execute() failed";
+                    p->set_exception(std::make_exception_ptr(std::runtime_error("write error")));
+                }
+                // 这里 一个socket会对应唯一的一个 epoll context, context 是单线程的，保证先写入的先调用回调
+                clients[which_sock].promises.push(p);
+            },
+            std::make_shared<std::string>(std::move(cmd)));
 
         return p;
     }
@@ -111,7 +122,8 @@ struct SimpleRedisClient::ClientImpl {
             std::shared_ptr<std::promise<RESPValue>> promise = nullptr;
 
             {
-                std::lock_guard lock(connection.lock);
+                // std::lock_guard lock(connection.lock);
+                // read 只会被 epoll 线程调用，保证不会出现线程安全问题
                 if (!connection.promises.empty()) {
                     promise = std::move(connection.promises.front());
                     connection.promises.pop();
