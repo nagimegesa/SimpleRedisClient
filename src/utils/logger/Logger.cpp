@@ -8,15 +8,17 @@
 #include <atomic>
 
 #include "SimpleCurrentQueue.hpp"
+#include "thread_pool/queue/LockFreeQueue.h"
 
 class LoggerWriter {
 public:
-    void write(std::string str) {
-        queue.enqueue(std::move(str));
+    void write(std::string&& str) {
+        // queue.enqueue(std::move(str));
+        // 不断写直到成功
+        while (!queue.push(std::move(str))) {}
     }
 
     void set_log_file(const char* file, bool create) {
-
         if (!std::filesystem::exists(file)) {
             if (!create) {
                 throw std::invalid_argument("File does not exist");
@@ -30,7 +32,6 @@ public:
             throw std::runtime_error("Cannot open file for writing");
         }
     }
-
 
     void close() {
         closed = true;
@@ -50,23 +51,42 @@ private:
     };
 
     void write_log() {
+        std::string logs;
         while (true) {
-            if (queue.size() > 0) {
-                std::string logs;
-                queue.dequeue(&logs);
+            while (queue.pop(logs)) {
                 std::cout << logs;
-                if (this->stream_) {
+                if (this->stream_.is_open()) {
                     this->stream_ << logs;
                 }
             }
-            if (closed && queue.size() == 0) {
+
+            if (closed && queue.empty()) {
                 break;
             }
+
+            // 没有日志直接退让， 盲目退让 开销很大，十分不稳定
+            // std::this_thread::yield();
+
+            // if (!queue.empty()) {
+            //     std::string logs;
+            //     queue.dequeue(&logs);
+            //     std::cout << logs;
+            //     if (this->stream_) {
+            //         this->stream_ << logs;
+            //     }
+            // }
+            // if (closed && queue.size() == 0) {
+            //     break;
+            // }
         }
     }
 
-    SimpleConcurrentQueue<std::string> queue;
+    // SimpleConcurrentQueue<std::string> queue;
+
+    MPSCQueue<std::string> queue {};
+
     std::thread writer_thread;
+
     std::atomic<bool> closed = false;
     std::ofstream stream_;
 };
@@ -75,26 +95,28 @@ private:
 LogEntry::LogEntry(LoggerWriter* writer, const char* file, int line, LogLevel level)
     : writer_(writer), level_(level) {
 
-    // 1. 开头先写时间戳
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    stream_ << "[" << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S") << "] ";
-    
-    // 2. 写日志级别
-    const char* level_str = (level == LogLevel::DEBUG) ? "[DEBUG]" :
-                            (level == LogLevel::INFO) ? "[INFO]" :
-                            (level == LogLevel::WARNING) ? "[WARNING]" :
-                            (level == LogLevel::ERR) ? "[ERROR]" : "[DEBUG]";
-    stream_ << level_str << " ";
+    if (level_ >= Logger::getInstance().get_log_level()) {
+        // 1. 开头先写时间戳
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        stream_ << "[" << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S") << "] ";
 
-    // 3. 写文件名和行号
-    stream_ << "[" << file << ":" << line << "] ";
+        // 2. 写日志级别
+        const char* level_str = (level == LogLevel::DEBUG) ? "[DEBUG]" :
+                                (level == LogLevel::INFO) ? "[INFO]" :
+                                (level == LogLevel::WARNING) ? "[WARNING]" :
+                                (level == LogLevel::ERR) ? "[ERROR]" : "[DEBUG]";
+        stream_ << level_str << " ";
+
+        // 3. 写文件名和行号
+        stream_ << "[" << file << ":" << line << "] ";
+    }
 }
 
 LogEntry::~LogEntry() {
     // 析构时：自动追加换行符，然后把整条内容交给 Writer
-    stream_ << "\n";
     if (writer_ && level_ >= Logger::getInstance().get_log_level()) {
+        stream_ << "\n";
         writer_->write(stream_.str());
     }
 }
