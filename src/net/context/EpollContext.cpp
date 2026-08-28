@@ -4,6 +4,7 @@
 
 #include "EpollContext.h"
 
+#include <assert.h>
 #include <mutex>
 #include <queue>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/uio.h>
 
 #include "logger/Logger.h"
 #include "queue/LockFreeQueue.h"
@@ -37,7 +39,8 @@ struct Connection {
     std::shared_ptr<ISocket> socket;          // 原始 socket（可能是 LinuxSocket）
     ReadContextCallBack read_cb;              // 读回调
     SimpleBuffer read_buffer;                 // 读缓冲区
-    std::queue<WriteMetaInfo> write_queue;    // 写队列
+    // std::queue<WriteMetaInfo> write_queue;    // 写队列
+    std::deque<WriteMetaInfo> write_queue;
     bool read_registered = false;             // 是否已注册 EPOLLIN
     bool write_registered = false;            // 是否已注册 EPOLLOUT
     bool peer_closed_ = false;                // 对端是否已关闭写端（收到 FIN）
@@ -219,52 +222,106 @@ private:
 
         auto& conn = it->second;
 
-        while (!conn->write_queue.empty()) {
-            auto& meta = conn->write_queue.front();
-            char* data = meta.buffer->data() + meta.offset;
-            size_t remaining = meta.buffer->size() - meta.offset;
-            int n = meta.socket->write(data, remaining);
+        // while (!conn->write_queue.empty()) {
+        //     auto& meta = conn->write_queue.front();
+        //     char* data = meta.buffer->data() + meta.offset;
+        //     size_t remaining = meta.buffer->size() - meta.offset;
+        //     int n = meta.socket->write(data, remaining);
+        //
+        //     if (n > 0) {
+        //         meta.offset += n;
+        //         if (meta.offset == meta.buffer->size()) {
+        //             if (meta.callback) meta.callback(true);
+        //             conn->write_queue.pop();
+        //         }
+        //     } else if (n == 0) {
+        //         LOG(DEBUG) << "EventLoopThread: handling write get write returns 0";
+        //         // 对端关闭，应视为错误
+        //         failAllPendingWrites(conn);
+        //         closeConnection(fd);
+        //         return;
+        //     } else { // n < 0
+        //         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        //             LOG(DEBUG) << "EventLoopThread: write error: errno " << errno;
+        //             // 写缓冲区满，等待下次 EPOLLOUT，停止本次处理
+        //             return;
+        //         } else {
+        //             LOG(ERR) << "EventLoopThread: write error on fd " << fd <<  " error code " << errno;
+        //             failAllPendingWrites(conn);
+        //             closeConnection(fd);
+        //             return;
+        //         }
+        //     }
+        // }
 
-            if (n > 0) {
-                meta.offset += n;
-                if (meta.offset == meta.buffer->size()) {
-                    if (meta.callback) meta.callback(true);
-                    conn->write_queue.pop();
-                }
-            } else if (n == 0) {
-                LOG(DEBUG) << "EventLoopThread: handling write get write returns 0";
-                // 对端关闭，应视为错误
-                failAllPendingWrites(conn);
-                closeConnection(fd);
+        int write_count = std::min(static_cast<int>(conn->write_queue.size()), IOV_MAX);
+        std::size_t total_size = 0;
+
+        std::vector<iovec> iovs;
+        std::vector<std::size_t> write_size_sum {};
+        iovs.reserve(write_count);
+        write_size_sum.reserve(write_count);
+
+        for (int i = 0; i < write_count; ++i) {
+            ::iovec iov{};
+            auto& data = conn->write_queue[i];
+            iov.iov_base = data.buffer->data() + data.offset;
+            iov.iov_len = data.buffer->size() - data.offset;
+            if (iov.iov_len > 0) {
+                iovs.emplace_back(iov);
+            }
+
+            total_size += iov.iov_len;
+            write_size_sum.push_back(total_size);
+        }
+
+        if (iovs.empty()) {
+            return;
+        }
+
+        ssize_t n = ::writev(fd, iovs.data(), static_cast<int>(iovs.size()));
+        if (n <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 写缓冲区满，等待下次 EPOLLOUT，停止本次处理
+                LOG(DEBUG) << "EventLoopThread: write buffer full";
                 return;
-            } else { // n < 0
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    LOG(DEBUG) << "EventLoopThread: write error: errno " << errno;
-                    // 写缓冲区满，等待下次 EPOLLOUT，停止本次处理
-                    return;
-                } else {
-                    LOG(ERR) << "EventLoopThread: write error on fd " << fd <<  " error code " << errno;
-                    failAllPendingWrites(conn);
-                    closeConnection(fd);
-                    return;
-                }
+            }
+            LOG(ERR) << "EventLoopThread: write error, error code " << errno;
+            failAllPendingWrites(conn);
+            closeConnection(fd);
+            return;
+        }
+
+        auto remaining = static_cast<size_t>(n);
+        while (!conn->write_queue.empty() && remaining > 0) {
+            auto& meta = conn->write_queue.front();
+            size_t unSent = meta.buffer->size() - meta.offset;
+            if (remaining >= unSent) {
+                remaining -= unSent;
+                if (meta.callback) meta.callback(true);
+                conn->write_queue.pop_front();
+            } else {
+                meta.offset += remaining;
+                remaining = 0;
             }
         }
 
-        // 写队列已空，更新事件监听状态
-        conn->write_registered = false;
-        if (conn->peer_closed_) {
-            // 对端已半关闭，且数据已发送完毕，移除所有事件，等待外部关闭
-            LOG(DEBUG) << "EventLoopThread: peer half-closed and all data sent, remove fd from epoll, fd " << fd;
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-        } else {
-            // 对端未关闭，根据读注册状态调整事件
-            if (conn->read_registered) {
-                modifyEpollEvents(fd, EPOLLIN);
-            } else {
-                // 无读事件，移除所有事件（保持连接，等待外部后续操作）
-                LOG(DEBUG) << "EventLoopThread: write queue empty and no read registered, remove fd from epoll, fd " << fd;
+        if (conn->write_queue.empty()) {
+            // 写队列已空，更新事件监听状态
+            conn->write_registered = false;
+            if (conn->peer_closed_) {
+                // 对端已半关闭，且数据已发送完毕，移除所有事件，等待外部关闭
+                LOG(DEBUG) << "EventLoopThread: peer half-closed and all data sent, remove fd from epoll, fd " << fd;
                 ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+            } else {
+                // 对端未关闭，根据读注册状态调整事件
+                if (conn->read_registered) {
+                    modifyEpollEvents(fd, EPOLLIN);
+                } else {
+                    // 无读事件，移除所有事件（保持连接，等待外部后续操作）
+                    LOG(DEBUG) << "EventLoopThread: write queue empty and no read registered, remove fd from epoll, fd " << fd;
+                    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                }
             }
         }
     }
@@ -276,7 +333,7 @@ private:
             if (meta.callback) {
                 meta.callback(false);
             }
-            conn->write_queue.pop();
+            conn->write_queue.pop_front();
         }
     }
 
@@ -362,7 +419,7 @@ public:
 
         // 添加写请求
         auto& conn = it->second;
-        conn->write_queue.emplace(socket, callback, buf);
+        conn->write_queue.emplace_back(socket, callback, buf);
 
         // 如果尚未注册写事件，则修改 epoll
         if (!conn->write_registered) {
