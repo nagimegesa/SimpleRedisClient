@@ -109,13 +109,13 @@ cd project-path
 
 SimpleRedisClient 4 条连接，每批 pipeline 深度 1000，共 1,000,000 条 `SET`：
 
-| 指标 | 结果 |
-| --- | --- |
-| 总命令数 Total commands | 1,000,000 |
-| 成功 Successful | 1,000,000 |
-| 失败 Failures | 0 |
-| 耗时 Elapsed | 2.60 s |
-| 吞吐 Throughput | **~384,064 ops/s** |
+| 指标 | 结果                 |
+| --- |--------------------|
+| 总命令数 Total commands | 1,000,000          |
+| 成功 Successful | 1,000,000          |
+| 失败 Failures | 0                  |
+| 耗时 Elapsed | 1.5 s              |
+| 吞吐 Throughput | **~666679 ops/s** |
 
 ### 2. Redis 异步 SET 压力测试 / `test_redis_bench`
 
