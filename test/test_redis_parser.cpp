@@ -106,10 +106,11 @@ void test_async_redis_basic() {
 
     // 累积缓冲区，处理可能的分包
     std::string pending;
-    context.registerAsyncRead(socket, [&](const std::string& buf, int size) -> bool {
+    context.registerAsyncRead(socket, [&](const std::string& buf, int size) -> std::size_t {
         pending += buf;
+        std::size_t pos = 0;
         try {
-            RESPValue result = RESP_Parser::parse(pending);
+            RESPValue result = RESP_Parser::parse(pending, pos);
             pending.clear();
 
             // 根据响应内容判断
@@ -122,12 +123,12 @@ void test_async_redis_basic() {
             }
             response_count++;
         } catch (const IncompleteRESPException&) {
-            return false; // 数据不完整，继续接收
+            return pos; // 数据不完整，继续接收
         } catch (const std::exception& e) {
             std::cerr << "Parse error in test: " << e.what() << std::endl;
             pending.clear();
         }
-        return true;
+        return pos;
     });
 
     context.run();

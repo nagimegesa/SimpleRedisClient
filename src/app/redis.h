@@ -97,6 +97,7 @@ private:
         val.type = RESPType::BulkString;
 
         if (len == -1) {
+            val.type = RESPType::Null;
             val.data = std::string();
             return val;
         }
