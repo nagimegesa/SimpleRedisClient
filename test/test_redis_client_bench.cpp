@@ -43,14 +43,12 @@ void pipeline_stress_test() {
     std::atomic<long long> success{0};
     std::atomic<long long> failures{0};
     auto start = std::chrono::steady_clock::now();
+    std::vector<std::shared_ptr<std::promise<RESPValue>>> promises;
+    promises.reserve(total_commands);
 
     // 单线程执行（模拟 redis-benchmark 的 -c 1 -P 1000）
     for (size_t batch = 0; batch < TOTAL_BATCHES; ++batch) {
-        // 存储本批次所有 future（promise 由 execute 返回）
-        std::vector<std::shared_ptr<std::promise<RESPValue>>> promises;
-        promises.reserve(BATCH_SIZE);
 
-        // 1. 连续发送 BATCH_SIZE 条 SET 命令，不等待
         for (size_t i = 0; i < BATCH_SIZE; ++i) {
             std::string key = "bench_key_" + std::to_string(batch * BATCH_SIZE + i);
             std::string value = random_string(10);
@@ -58,23 +56,22 @@ void pipeline_stress_test() {
             promises.push_back(client.execute({"SET", key, value}));
         }
 
-        // 2. 统一等待所有响应
-        for (auto& p : promises) {
-            auto resp = p->get_future().get();
-            if (resp.type == RESPType::SimpleString && resp.as_string() == "OK") {
-                success++;
-            } else {
-                failures++;
-            }
-        }
-
-        // 可选：每 10 批打印一次进度
         if ((batch + 1) % 10 == 0) {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - start).count();
             std::cout << "  Batch " << (batch + 1) << "/" << TOTAL_BATCHES
                       << ", commands sent: " << (batch + 1) * BATCH_SIZE
                       << ", elapsed: " << elapsed << " s\n";
+        }
+    }
+
+    // 2. 统一等待所有响应
+    for (auto& p : promises) {
+        auto resp = p->get_future().get();
+        if (resp.type == RESPType::SimpleString && resp.as_string() == "OK") {
+            success++;
+        } else {
+            failures++;
         }
     }
 

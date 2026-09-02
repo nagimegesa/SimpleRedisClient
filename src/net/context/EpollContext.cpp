@@ -21,7 +21,7 @@
 #include "queue/LockFreeQueue.h"
 #include "socket/LinuxSocket.h"
 
-// 写元信息（原代码中的 WriteMetaInfo）
+// 写元信息
 struct WriteMetaInfo {
     std::shared_ptr<ISocket> socket;
     std::shared_ptr<std::string> buffer;
@@ -34,9 +34,9 @@ struct WriteMetaInfo {
 
 // ------------------------- 内部结构定义 -------------------------
 
-// 连接对象，封装一个 fd 的所有状态（仅在事件循环线程中访问，无需加锁）
+// 连接对象，封装一个 fd 的所有状态
 struct Connection {
-    std::shared_ptr<ISocket> socket;          // 原始 socket（可能是 LinuxSocket）
+    std::shared_ptr<ISocket> socket;          // 原始 socket
     ReadContextCallBack read_cb;              // 读回调
     SimpleBuffer read_buffer;                 // 读缓冲区
     // std::queue<WriteMetaInfo> write_queue;    // 写队列
@@ -50,7 +50,7 @@ struct Connection {
         read_buffer.resize(DEFAULT_BUFFER_SIZE);
     }
 
-    constexpr static int DEFAULT_BUFFER_SIZE = 2048;
+    constexpr static int DEFAULT_BUFFER_SIZE = 4096;
 };
 
 // 单个事件循环线程的实现

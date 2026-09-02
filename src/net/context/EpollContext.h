@@ -56,6 +56,7 @@ struct SimpleBuffer {
 
     void clear() {
         data_size_ = 0;
+        std::memset(buffer.data(), 0, buffer.size());
     }
 
     void read(std::size_t n) {
