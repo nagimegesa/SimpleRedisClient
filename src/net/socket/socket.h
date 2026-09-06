@@ -9,7 +9,9 @@
 
 class SocketManager;
 class EpollContext;
+class ISocket;
 
+using AcceptContextCallback = std::function<void(const EpollContext& context, std::shared_ptr<ISocket> client)>;
 using ReadContextCallBack = std::function<std::size_t(const std::string&, int size)>;
 using WriteContextCallBack = std::function<void(bool)>;
 
@@ -24,14 +26,15 @@ public:
     virtual bool connect(const char* ip, unsigned short port) = 0;
     virtual void close() = 0;
     virtual void setNoBlock() = 0;
-    virtual void asyncRead(const EpollContext& context, const ReadContextCallBack& call_back) = 0;
+    virtual void asyncAccept(const EpollContext& context, const AcceptContextCallback& callback) = 0;
+    virtual void asyncRead(const EpollContext& context, const ReadContextCallBack& callback) = 0;
     virtual void asyncWriteOnce(
         const EpollContext&                 context,
         const WriteContextCallBack&         callback,
         const std::shared_ptr<std::string>& buf
     ) = 0;
 
-    static constexpr int default_backlog = -1;
+    static constexpr int DEFAULT_BACKLOG = -1;
 };
 
 #endif

@@ -23,12 +23,13 @@ public:
     int                      write(const char* msg, int len) override;
     bool                     connect(const char* ip, unsigned short port) override;
     void                     close() override;
-    void                     asyncRead(const EpollContext& context, const ReadContextCallBack& call_back);
+    void                     asyncAccept(const EpollContext& context, const AcceptContextCallback& callback) override;
+    void                     asyncRead(const EpollContext& context, const ReadContextCallBack& call_back) override;
     void                     asyncWriteOnce(
         const EpollContext&                 context,
         const WriteContextCallBack&         callback,
         const std::shared_ptr<std::string>& buf
-    );
+    ) override;
     void setNoBlock() override;
     int getNative() const;
 };

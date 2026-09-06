@@ -72,7 +72,7 @@ target_include_directories(
 )
 
 add_library(redis src/app/SimpleRedisClient.cpp)
-target_link_libraries(redis net)
+target_link_libraries(redis net ${TCMALLOC_LIB}) # 这里连接 tcmalloc
 target_include_directories(redis PUBLIC src/app)
 
 if (CMAKE_SYSTEM_NAME MATCHES "Windows")
@@ -89,6 +89,7 @@ add_executable(test_redis_bench test/test_redis_bench.cpp)
 add_executable(test_redis_client_acc test/test_redis_client_bench.cpp)
 
 add_executable(test_spsc_queue test/test_queue/test_spsc_queue.cpp)
+add_executable(test_echo_server test/net/test_echo_server.cpp)
 
 target_link_libraries(main thread utils net)
 target_link_libraries(redis_cli redis)
@@ -97,8 +98,9 @@ target_link_libraries(test_thread_pool thread)
 target_link_libraries(test_thread_pool_result thread)
 target_link_libraries(test_redis_acc redis)
 #target_link_libraries(test_redis_client_acc redis ${PROFILER_LIB})
-target_link_libraries(test_redis_client_acc redis ${TCMALLOC_LIB} ${PROFILER_LIB})
+target_link_libraries(test_redis_client_acc redis ${PROFILER_LIB})
 target_link_libraries(test_redis_bench redis)
 target_link_libraries(test_spsc_queue utils thread)
+target_link_libraries(test_echo_server utils thread net)
 target_include_directories(test_thread_pool PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_include_directories(test_thread_pool_result PUBLIC ${PROJECT_SOURCE_DIR}/src)

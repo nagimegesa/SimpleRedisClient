@@ -4,13 +4,13 @@
 
 #include "EpollContext.h"
 
-#include <assert.h>
 #include <mutex>
 #include <queue>
 #include <atomic>
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -53,10 +53,19 @@ struct Connection {
     constexpr static int DEFAULT_BUFFER_SIZE = 4096;
 };
 
+struct AcceptContext {
+    std::shared_ptr<ISocket> socket;
+    AcceptContextCallback accept_cb;
+
+    AcceptContext(std::shared_ptr<ISocket> s, AcceptContextCallback cb) : socket(std::move(s)), accept_cb(std::move(cb)) {
+    }
+};
+
 // 单个事件循环线程的实现
 class EventLoopThread {
 public:
-    EventLoopThread() : epoll_fd_(-1), wakeup_fd_(-1), running_(false) {
+    EventLoopThread(EpollContext& epoll_context) : epoll_fd_(-1), wakeup_fd_(-1), running_(false),
+        epoll_context(epoll_context) { // 注意这里 构造函数里面不要使用 epoll_context 否则出现未定义行为
         epoll_fd_ = ::epoll_create(1);
         if (epoll_fd_ == -1) {
             LOG(ERR) << "EventLoopThread: epoll_create failed";
@@ -163,7 +172,21 @@ private:
         }
     }
 
+    void handleAccept(int fd) const {
+        auto& context = accept_socket_set_.find(fd)->second;
+        auto client = context->socket->accept();
+        if (context->accept_cb) {
+            context->accept_cb(epoll_context, client);
+        }
+    }
+
     void handleRead(int fd) {
+
+        if (accept_socket_set_.contains(fd)) { // server 读事件
+            handleAccept(fd);
+            return;
+        }
+
         auto it = connections_.find(fd);
         if (it == connections_.end()) return;
         auto& conn = it->second;
@@ -360,6 +383,21 @@ private:
     }
 
 public:
+    void doRegisterAccept(int fd, const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) {
+        if (accept_socket_set_.find(fd) != accept_socket_set_.end()) {
+            LOG(WARNING) << "EventLoopThread: already register accept, fd " << fd;
+            accept_socket_set_[fd]->accept_cb = callback;
+            return;
+        }
+        accept_socket_set_[fd] = std::make_shared<AcceptContext>(socket, callback);
+        socket->setNoBlock();
+
+        epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
+    }
+
     // 以下为通过 postTask 调用的函数（在事件循环线程执行）
     void doRegisterRead(int fd, const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) {
         // 如果连接已存在，更新读回调和事件；否则新建
@@ -388,10 +426,7 @@ public:
         conn->read_registered = true;
         connections_[fd] = conn;
 
-        // 设置 socket 非阻塞（假设在外部已设置，这里再次确保）
-        if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
-            sc->setNoBlock();
-        }
+        socket->setNoBlock(); // 设置非阻塞
 
         // 注册到 epoll
         epoll_event ev{};
@@ -443,22 +478,30 @@ private:
     std::thread thread_;
 
     std::unordered_map<int, std::shared_ptr<Connection>> connections_; // 仅在事件循环线程访问
+    std::unordered_map<int, std::shared_ptr<AcceptContext>> accept_socket_set_;
     // std::queue<std::function<void()>> task_queue_;                     // 待处理任务队列
     // std::mutex task_mutex_;                                            // 保护任务队列
     MPSCQueue<std::function<void()>, 4096> task_queue_;
 
+    EpollContext& epoll_context;
     constexpr static int MAX_EVENTS = 2048;
+    friend EpollContextImpl;
 };
 
 // ------------------------- EpollContext::Impl -------------------------
 struct EpollContextImpl {
+
     static constexpr int loop_size = 4;
+    std::vector<std::unique_ptr<EventLoopThread>> loops_;
 public:
-    EpollContextImpl() {
+
+    EpollContext& epoll_context;
+
+    EpollContextImpl(EpollContext& context) : epoll_context(context) {
         // 创建两个事件循环线程（可根据需要调整）
         loops_.reserve(loop_size);
         for (int i = 0; i < loop_size; ++i) {
-            loops_.emplace_back(std::make_unique<EventLoopThread>());
+            loops_.emplace_back(std::make_unique<EventLoopThread>(epoll_context));
         }
     }
 
@@ -466,6 +509,24 @@ public:
         // 停止所有事件循环
         for (auto& loop : loops_) {
             loop->stop();
+        }
+    }
+
+    void registerAccept(const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) {
+        if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
+            int fd = sc->getNative();
+            if (fd == -1) {
+                LOG(ERR) << "EpollContext: invalid socket fd";
+                return;
+            }
+            // 根据 fd 哈希选择事件循环线程
+            size_t index = std::hash<int>{}(fd) % loops_.size();
+            // 提交任务到对应线程
+            loops_[index]->postTask([this, index, fd, socket, callback] {
+                loops_[index]->doRegisterAccept(fd, socket, callback);
+            });
+        } else {
+            LOG(ERR) << "EpollContext is only for linux socket";
         }
     }
 
@@ -529,13 +590,15 @@ public:
         }
     }
 
-private:
-    std::vector<std::unique_ptr<EventLoopThread>> loops_;
 };
 
-EpollContext::EpollContext() : impl(std::make_unique<EpollContextImpl>()) {}
+EpollContext::EpollContext() : impl(std::make_unique<EpollContextImpl>(*this)) {}
 
 EpollContext::~EpollContext() = default;
+
+void EpollContext::registerAsyncAccept(const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) const {
+    impl->registerAccept(socket, callback);
+}
 
 void EpollContext::registerAsyncRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) const {
     impl->registerRead(socket, callback);

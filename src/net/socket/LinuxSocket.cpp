@@ -53,7 +53,7 @@ bool LinuxSocket::listen(int backlog) {
     }
 
     // 如果 backlog 为 0 或负数，使用默认值（例如 SOMAXCONN）
-    if (backlog == default_backlog) {
+    if (backlog == DEFAULT_BACKLOG) {
         backlog = SOMAXCONN;
     }
 
@@ -123,6 +123,10 @@ void LinuxSocket::close() {
         ::close(socket_fd);
         socket_fd = -1;
     }
+}
+
+void LinuxSocket::asyncAccept(const EpollContext& context, const AcceptContextCallback& callback) {
+    context.registerAsyncAccept(shared_from_this(), callback);
 }
 
 void LinuxSocket::asyncRead(const EpollContext& context, const ReadContextCallBack& call_back) {
