@@ -92,13 +92,13 @@ void test_parse_resp() {
 void test_async_redis_basic() {
     std::cout << "\n== Testing async Redis basic commands ==\n";
 
-    auto socket = SocketManager::getInstance().getSocket();
+    auto context = std::make_shared<EpollContext>();
+    auto socket = SocketManager::getInstance().getSocket(context);
     if (!socket->connect("127.0.0.1", 6379)) {
         CHECK(false, "Connect to Redis");
         return;
     }
 
-    EpollContext context;
     std::atomic<int> response_count{0};
     std::atomic<bool> got_pong{false};
     std::atomic<bool> got_ok{false};
@@ -106,7 +106,7 @@ void test_async_redis_basic() {
 
     // 累积缓冲区，处理可能的分包
     std::string pending;
-    context.registerAsyncRead(socket, [&](const std::string& buf, int size) -> std::size_t {
+    context->registerAsyncRead(socket, [&](const std::string& buf, int size) -> std::size_t {
         pending += buf;
         std::size_t pos = 0;
         try {
@@ -131,25 +131,25 @@ void test_async_redis_basic() {
         return pos;
     });
 
-    context.run();
+    context->run();
 
     // 发送 PING
     std::string cmd1 = buildRESPCommand({"PING"});
-    socket->asyncWriteOnce(context, [](bool ok) {
+    socket->asyncWriteOnce([](bool ok) {
         if (!ok) std::cerr << "Write failed for PING" << std::endl;
     }, std::make_shared<std::string>(std::move(cmd1)));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     // 发送 SET
     std::string cmd2 = buildRESPCommand({"SET", "testkey", "testvalue"});
-    socket->asyncWriteOnce(context, [](bool ok) {
+    socket->asyncWriteOnce([](bool ok) {
         if (!ok) std::cerr << "Write failed for SET" << std::endl;
     }, std::make_shared<std::string>(std::move(cmd2)));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     // 发送 GET
     std::string cmd3 = buildRESPCommand({"GET", "testkey"});
-    socket->asyncWriteOnce(context, [](bool ok) {
+    socket->asyncWriteOnce([](bool ok) {
         if (!ok) std::cerr << "Write failed for GET" << std::endl;
     }, std::make_shared<std::string>(std::move(cmd3)));
 

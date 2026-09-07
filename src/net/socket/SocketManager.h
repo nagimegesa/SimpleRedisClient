@@ -16,7 +16,7 @@ public:
 
     static SocketManager &getInstance();
 
-    std::shared_ptr<ISocket> getSocket();
+    std::shared_ptr<ISocket> getSocket(const std::shared_ptr<EpollContext>& context);
 
     ~SocketManager();
 };

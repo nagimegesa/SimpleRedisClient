@@ -12,14 +12,15 @@
 #include <string>
 #include "context/EpollContext.h"
 
-LinuxSocket::LinuxSocket() {
+LinuxSocket::LinuxSocket(const std::shared_ptr<EpollContext>& epoll_context) : ISocket(epoll_context) {
     socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd == -1) {
         LOG(ERR) << "LinuxSocket::LinuxSocket(): invalid socket";
     }
 }
 
-LinuxSocket::LinuxSocket(int fd) : socket_fd(fd) {}
+LinuxSocket::LinuxSocket(int fd, const std::shared_ptr<EpollContext>& epoll_context) : ISocket(epoll_context), socket_fd(fd) {
+}
 
 LinuxSocket::~LinuxSocket() {
     LinuxSocket::close();
@@ -77,8 +78,11 @@ std::shared_ptr<ISocket> LinuxSocket::accept() {
         LOG(ERR) << "LinuxSocket::accept(): accept failed";
         return nullptr;
     }
-
-    return std::make_shared<LinuxSocket>(client_fd);
+    if (auto context = epollContext_.lock()) {
+        return std::make_shared<LinuxSocket>(client_fd, context);
+    }
+    LOG(ERR) << "LinuxSocket::accept(): accept failed";
+    return nullptr;
 }
 
 int LinuxSocket::read(char* msg, int len) {
@@ -120,22 +124,37 @@ bool LinuxSocket::connect(const char* ip, unsigned short port) {
 
 void LinuxSocket::close() {
     if (socket_fd != -1) {
+        if (auto context = epollContext_.lock()) {
+            context->removeSocket(shared_from_this());
+        }
         ::close(socket_fd);
         socket_fd = -1;
     }
 }
 
-void LinuxSocket::asyncAccept(const EpollContext& context, const AcceptContextCallback& callback) {
-    context.registerAsyncAccept(shared_from_this(), callback);
+void LinuxSocket::asyncAccept(const AcceptContextCallback& callback) {
+    if (auto context = epollContext_.lock()) {
+        context->registerAsyncAccept(shared_from_this(), callback);
+    } else {
+        LOG(ERR) << "LinuxSocket::asyncAccept(): epollContext is nullptr";
+    }
 }
 
-void LinuxSocket::asyncRead(const EpollContext& context, const ReadContextCallBack& call_back) {
-    context.registerAsyncRead(shared_from_this(), call_back);
+void LinuxSocket::asyncRead(const ReadContextCallBack& call_back) {
+    if (auto context = epollContext_.lock()) {
+        context->registerAsyncRead(shared_from_this(), call_back);
+    } else {
+        LOG(ERR) << "LinuxSocket::asyncRead(): epollContext is nullptr";
+    }
 }
 
-void LinuxSocket::asyncWriteOnce(const EpollContext& context,
+void LinuxSocket::asyncWriteOnce(
     const WriteContextCallBack& callback, const std::shared_ptr<std::string>& buf) {
-    context.asyncWriteOnce(shared_from_this(), callback, buf);
+    if (auto context = epollContext_.lock()) {
+        context->asyncWriteOnce(shared_from_this(), callback, buf);
+    } else {
+        LOG(ERR) << "LinuxSocket::asyncWriteOnce: epollContext is nullptr";
+    }
 }
 
 void LinuxSocket::setNoBlock() {

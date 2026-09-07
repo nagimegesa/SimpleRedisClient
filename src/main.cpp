@@ -30,9 +30,9 @@ int main() {
     // ---------- 初始化日志 ----------
     Logger::getInstance().set_log_file("./logs/app.log");
     // Logger::getInstance().set_log_level(DEBUG);
-
+    auto context = std::make_shared<EpollContext>();
     // ---------- 连接 Redis ----------
-    auto socket = SocketManager::getInstance().getSocket();
+    auto socket = SocketManager::getInstance().getSocket(context);
     if (!socket->connect("127.0.0.1", 6379)) {
         LOG(ERR) << "connect redis failed";
         return 1;
@@ -41,11 +41,11 @@ int main() {
     LOG(INFO) << "Type 'quit' or 'exit' to leave.";
 
     // ---------- 设置异步读取（Epoll） ----------
-    EpollContext context;
-    context.registerAsyncRead(socket, onRedisResponse);
+
+    context->registerAsyncRead(socket, onRedisResponse);
 
     // ---------- 启动 Epoll 事件循环线程 ----------
-    context.run();
+    context->run();
     // ---------- 主交互循环 ----------
     std::string input;
     while (true) {
@@ -81,7 +81,7 @@ int main() {
         std::string cmd = buildRESPCommand(args);
         LOG(DEBUG) << "cmd: " << cmd;
 
-        socket->asyncWriteOnce(context, [](bool res) {
+        socket->asyncWriteOnce( [](bool res) {
             if (res == true) {
                 LOG(INFO) << "redis response success";
             } else {

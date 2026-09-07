@@ -17,13 +17,14 @@ int main(int argc, char* argv[]) {
     // 设置为 DEBUG 以便看到框架的 ERR 日志（比如连接关闭、读写错误等）
     Logger::getInstance().set_log_level(DEBUG);
 
-    auto socket = SocketManager::getInstance().getSocket();
+    auto context = std::make_shared<EpollContext>();
+    auto socket = SocketManager::getInstance().getSocket(context);
     if (!socket->connect("127.0.0.1", 6379)) {
         std::cerr << "Failed to connect to Redis\n";
         return 1;
     }
 
-    EpollContext context;
+
 
     std::atomic<int> success_count{0};
     std::atomic<int> fail_count{0};
@@ -32,7 +33,7 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> all_done{false};
 
     int count = 0;
-    context.registerAsyncRead(socket, [&](const std::string& buf, size_t size) -> size_t {
+    context->registerAsyncRead(socket, [&](const std::string& buf, size_t size) -> size_t {
         size_t pos = 0;
         int parsed = 0;
         while (pos < size) {
@@ -66,7 +67,7 @@ int main(int argc, char* argv[]) {
         //            << " responses, consumed " << pos << " bytes, buffer size " << size;
         return pos;
     });
-    context.run();  // 启动事件循环线程
+    context->run();  // 启动事件循环线程
 
     auto start = std::chrono::steady_clock::now();
 
@@ -77,7 +78,7 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> args = {"SET", key, value};
         std::string cmd = buildRESPCommand(args);
 
-        context.asyncWriteOnce(socket,
+        context->asyncWriteOnce(socket,
             [&](bool ok) {
                 if (ok) {
                     ++write_success;

@@ -5,6 +5,8 @@
 
 #include "SocketManager.h"
 
+#include <mutex>
+
 #include "logger/Logger.h"
 
 #ifdef _WIN32
@@ -54,12 +56,12 @@ SocketManager& SocketManager::getInstance() {
     return instance;
 }
 
-std::shared_ptr<ISocket> SocketManager::getSocket() {
+std::shared_ptr<ISocket> SocketManager::getSocket(const std::shared_ptr<EpollContext>& context) {
 #ifdef _WIN32
     std::call_once(wsa_inited, []() {wsa_init();});
     return std::make_shared<WindowsSocket>();
 #elif __linux__
-    return std::make_shared<LinuxSocket>();
+    return std::make_shared<LinuxSocket>(context);
 #endif
     throw std::runtime_error("Socket Manager not implemented yet");
     return nullptr;

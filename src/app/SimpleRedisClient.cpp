@@ -25,19 +25,17 @@ struct RedisConnection {
 };
 
 struct SimpleRedisClient::ClientImpl {
-    std::unique_ptr<EpollContext> epollContext;
+    std::shared_ptr<EpollContext> epollContext;
     std::vector<RedisConnection> clients;
     static thread_local std::size_t counter;
 
     ClientImpl() {
+        epollContext = std::make_shared<EpollContext>();
         clients.resize(DEFAULT_CLIENT_COUNT);
         for (int i = 0; i < DEFAULT_CLIENT_COUNT; i++) {
-            clients[i].socket = SocketManager::getInstance().getSocket();
+            clients[i].socket = SocketManager::getInstance().getSocket(epollContext);
         }
-
-        epollContext = std::make_unique<EpollContext>();
     }
-
 
     ~ ClientImpl() = default;
 
@@ -54,7 +52,7 @@ struct SimpleRedisClient::ClientImpl {
         }
 
         for (auto& client : clients) {
-            client.socket->asyncRead(*epollContext, [this, &client](const std::string& buf, std::size_t sz) {
+            client.socket->asyncRead([this, &client](const std::string& buf, std::size_t sz) {
                 return this->read(client, buf, sz);
             });
         }
@@ -65,10 +63,11 @@ struct SimpleRedisClient::ClientImpl {
     void close() {
         for (const auto& client : clients) {
             if (client.socket != nullptr) {
-                epollContext->close(client.socket);
                 client.socket->close();
             }
         }
+
+        epollContext->close();
     }
 
     std::shared_ptr<std::promise<RESPValue>> execute(std::string cmd) {
@@ -89,7 +88,7 @@ struct SimpleRedisClient::ClientImpl {
         //     clients[which_sock].promises.push(p);
         // }
 
-        clients[which_sock].socket->asyncWriteOnce(*epollContext,
+        clients[which_sock].socket->asyncWriteOnce(
             [p, this, which_sock](bool success) {
                 if (!success) {
                     LOG(ERR) << "SimpleRedisClient::execute() failed";

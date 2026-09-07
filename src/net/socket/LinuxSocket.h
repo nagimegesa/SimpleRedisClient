@@ -9,8 +9,8 @@ class LinuxSocket: public ISocket {
     int socket_fd = -1;
 
 public:
-    LinuxSocket();
-    LinuxSocket(int fd);
+    LinuxSocket(const std::shared_ptr<EpollContext>& epoll_context);
+    explicit LinuxSocket(int fd, const std::shared_ptr<EpollContext>& epoll_context);
 
     LinuxSocket(const LinuxSocket& sock) = delete;
     LinuxSocket& operator=(const LinuxSocket& sock) = delete;
@@ -23,10 +23,9 @@ public:
     int                      write(const char* msg, int len) override;
     bool                     connect(const char* ip, unsigned short port) override;
     void                     close() override;
-    void                     asyncAccept(const EpollContext& context, const AcceptContextCallback& callback) override;
-    void                     asyncRead(const EpollContext& context, const ReadContextCallBack& call_back) override;
+    void                     asyncAccept(const AcceptContextCallback& callback) override;
+    void                     asyncRead(const ReadContextCallBack& call_back) override;
     void                     asyncWriteOnce(
-        const EpollContext&                 context,
         const WriteContextCallBack&         callback,
         const std::shared_ptr<std::string>& buf
     ) override;

@@ -7,7 +7,6 @@
 #include <thread>
 #include <atomic>
 
-#include "SimpleCurrentQueue.hpp"
 #include "thread_pool/queue/LockFreeQueue.h"
 
 class LoggerWriter {

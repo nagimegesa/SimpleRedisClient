@@ -29,8 +29,9 @@ public:
     void registerAsyncAccept(const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) const;
     void registerAsyncRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) const;
     void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback, const std::shared_ptr<std::string>& buf) const;
-    void close(const std::shared_ptr<ISocket>& socket) const;
-    void run() const;
+    void removeSocket(const std::shared_ptr<ISocket>& socket) const;
+    void run(bool block=false) const;
+    void close() const;
 
     ~EpollContext();
 };

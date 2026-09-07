@@ -6,22 +6,39 @@
 
 #include "context/EpollContext.h"
 #include "logger/Logger.h"
+#include "socket/LinuxSocket.h"
 #include "socket/SocketManager.h"
 
 int main() {
-    EpollContext context;
-    auto socket = SocketManager::getInstance().getSocket();
 
-    socket->bind("127.0.0.1", 8080);
+    Logger::getInstance().set_log_level(DEBUG);
+
+    auto context = std::make_shared<EpollContext>();
+    auto socket = SocketManager::getInstance().getSocket(context);
+
+    socket->bind("127.0.0.1", 8081);
     socket->listen(ISocket::DEFAULT_BACKLOG);
 
     std::vector<std::shared_ptr<ISocket>> clients;
 
-    socket->asyncAccept(context, [&clients](const EpollContext& context, std::shared_ptr<ISocket> client) {
+    socket->asyncAccept([&clients](std::shared_ptr<ISocket> client) {
+        if (auto c = std::static_pointer_cast<LinuxSocket>(client)) {
+            LOG(INFO) << "Client accept fd: " << c->getNative();
+        }
         clients.push_back(client);
-        client->asyncRead(context, [client, &context](const std::string& buf, int size)->int {
+        client->asyncRead( [client](const std::string& buf, int size)->int {
+
+            if (size == 0) {
+                LOG(INFO) << "client closed write, try close socket";
+                client->close();
+                return 0;
+            }
+
             auto buffer = buf.substr(0, size);
-            client->asyncWriteOnce(context, [](bool success) {
+
+            std::cout << "recv: " << buffer << std::endl;
+
+            client->asyncWriteOnce([](bool success) {
                 if (!success) {
                     LOG(ERR) << "writeOnce failed";
                 }
@@ -30,15 +47,16 @@ int main() {
         });
     });
 
-    context.run();
+    context->run();
     std::string input;
     while (true) {
         std::getline(std::cin, input);
         if (input == "exit") {
             break;
         }
+
         auto write_buf = std::make_shared<std::string>(std::move(input));
-        socket->asyncWriteOnce(context, [](bool success) {
+        socket->asyncWriteOnce([](bool success) {
             // std::cout << success << std::endl;
             if (!success) {
                 LOG(ERR) << "writeOnce failed";
