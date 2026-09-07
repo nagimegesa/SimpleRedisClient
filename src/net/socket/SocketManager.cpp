@@ -61,7 +61,7 @@ std::shared_ptr<ISocket> SocketManager::getSocket() {
 #elif __linux__
     return std::make_shared<LinuxSocket>();
 #endif
-
+    throw std::runtime_error("Socket Manager not implemented yet");
     return nullptr;
 }
 
