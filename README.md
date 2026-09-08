@@ -1,79 +1,46 @@
-# Simple Redis client
+# Simple Redis Client
 
-一个基于 C++20 的轻量级 Redis 客户端 Demo：实现了 RESP 协议编解码、基于 epoll 的异步网络框架、线程池，以及一个带连接池与 pipeline 能力的高层客户端 `SimpleRedisClient`。
+一个基于 C++20 的轻量级 Redis 客户端示例实现，包含 RESP 协议编解码、基于 epoll 的异步网络框架、线程池，以及一个带连接池和 pipeline 能力的高层客户端 `SimpleRedisClient`。
 
-A lightweight Redis client demo written in C++20: RESP protocol encode/decode, an epoll-based async network framework, a thread pool, and a high-level client `SimpleRedisClient` with connection pool and pipeline support.
+---
 
-# 项目介绍(Project introduce)
+## 主要特性
 
-### 主要特性 / Features
+- **RESP 协议**：提供完整的命令构建函数 `buildRESPCommand` 与响应解析器 `RESP_Parser`，支持 Simple String、Error、Integer、Bulk String、Array、Null 六种类型。当接收到的数据不完整时，解析器会抛出 `IncompleteRESPException`，调用方可据此继续等待后续数据。
+- **异步网络框架**：`EpollContext` 基于 Linux epoll 和 eventfd 实现多事件循环线程，非阻塞读写，自动处理分包与粘包。**仅支持 Linux / WSL2**。
+- **高层客户端**：`SimpleRedisClient` 内置 4 条连接（由 `DEFAULT_CLIENT_COUNT` 指定），采用**线程局部轮询**策略：每个线程维护自己的计数器，依次将请求分发到各连接，无需加锁，适合多线程环境。
+- **线程池**：包含自旋锁 `SpinLock`、任务队列调度、`Result` 结果回传与异常捕获。
+- **日志系统**：`Logger` 支持 DEBUG、INFO、WARNING、ERROR 四个级别，通过宏 `LOG(level)` 使用。
 
-- **RESP 协议**：提供完整的 RESP 命令构建函数 `buildRESPCommand` 与响应解析器 `RESP_Parser`，支持 Simple String、Error、Integer、Bulk String、Array、Null 六种类型，不完整的数据通过 `IncompleteRESPException` 处理。
-- **异步网络框架**：`EpollContext` 基于 Linux epoll 与 eventfd 实现多事件循环线程，非阻塞读写，自动处理分包与粘包，仅支持 Linux 与 WSL2。
-- **高层客户端**：`SimpleRedisClient` 内置 4 条连接，数量由 `DEFAULT_CLIENT_COUNT = 4` 指定，按线程局部计数轮询分发请求，支持 pipeline 批量发送后统一等待响应。
-- **线程池**： `ThreadPool`包含自旋锁 `SpinLock`、任务队列调度、`Result` 结果回传与异常捕获。
-- **日志系统**：`Logger` 支持 DEBUG、INFO、WARNING、ERROR 四个级别。
+---
 
-### 目录结构 / Directory Layout
+## 环境要求与快速开始
 
-```
-src/
-  app/          SimpleRedisClient、RESP 协议 redis.h
-  net/          SocketManager、Linux/Windows Socket、EpollContext
-  utils/        Logger、ThreadPool、SpinLock、队列
-  main.cpp      epoll 异步版交互式客户端
-  redis_cli.cpp SimpleRedisClient 版交互式客户端
-test/
-  test_redis_bench.cpp          SET 压力测试，单连接 epoll 异步
-  test_redis_client_bench.cpp   pipeline 压力测试，SimpleRedisClient 
-  test_redis_parser.cpp         RESP 解析与异步集成正确性测试
-  test_thread_pool_benchmark.cpp 线程池正确性与性能基准
-  test_thread_pool_result.cpp   线程池 Result 接口冒烟测试
-```
+### 环境要求
+- **操作系统**：Linux 或 WSL2（`EpollContext` 依赖 epoll，Windows 原生不支持）。
+- **编译器**：GCC 14 或更高版本（CMakeLists.txt 中已指定 `/usr/bin/gcc-14` 和 `/usr/bin/g++-14`）。
+- **构建工具**：CMake 3.10+。
+- **Redis 服务**：默认连接 `127.0.0.1:6379`，请确保 Redis 已启动。
 
-### 构建目标 / Build Targets
-
-| Target | 说明 |
-| --- | --- |
-| `main` | 交互式 Redis 客户端，epoll 异步版 |
-| `redis_cli` | 交互式 Redis 客户端，SimpleRedisClient 版 |
-| `test_redis_bench` | SET 压力测试，参数为命令条数 N，默认 200000 |
-| `test_redis_client_acc` | pipeline 压力测试，1,000,000 条 SET，数量可在源码中调整 |
-| `test_redis_acc` | RESP 解析正确性与异步集成测试 |
-| `test_thread_pool` | 线程池正确性与性能基准 |
-| `test_thread_pool_result` | 线程池 Result 接口冒烟测试 |
-
-# 如何运行(How to run)
-
-### 环境要求 / Prerequisites
-
-- **Linux / WSL2**：`EpollContext` 仅支持 Linux，Windows 上编译会触发 `static_assert`。
-- 编译器：`gcc-14 / g++-14`，`CMakeLists.txt` 中已固定路径 `/usr/bin/gcc-14` 与 `/usr/bin/g++-14`。
-- CMake 3.10 或更高版本。
-- 一个正在运行的 Redis 服务，默认连接 `127.0.0.1:6379`。
-
-### 编译 / Build
-
+### 编译
 ```bash
 cd project-path
 
-# 以 Release 为例，Debug 与 RelWithDebInfo 同理
-cmake -S . -B cmake-build-release-wsl -DCMAKE_BUILD_TYPE=Release
-cmake --build cmake-build-release-wsl -j$(nproc)
+# Release 编译（推荐）
+cmake -S . -B cmake-build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-release -j$(nproc)
 ```
 
-### 运行客户端 / Run the CLI
-
+### 运行交互式客户端
 ```bash
-# 推荐使用 SimpleRedisClient 版
-./cmake-build-release-wsl/redis_cli
+# 使用 SimpleRedisClient 版（推荐）
+./cmake-build-release/redis_cli
 
-# epoll 异步版
-./cmake-build-release-wsl/main
+# 使用 epoll 异步版
+./cmake-build-release/main
 ```
 
 示例会话：
-
 ```
 redis> PING
 (string) PONG
@@ -82,66 +49,191 @@ redis> SET foo bar
 redis> GET foo
 (bulk) bar
 redis> quit
+Bye.
 ```
 
-### 运行测试与基准 / Run Tests & Benchmarks
+---
 
-```bash
-cd project-path
+## 基本用法
 
-# 正确性测试
-./cmake-build-debug-wsl/test_redis_acc
-./cmake-build-release-wsl/test_thread_pool_result
+### 1. 网络框架：实现一个 ECHO 服务器
+```cpp
+#include <iostream>
+#include "context/EpollContext.h"
+#include "logger/Logger.h"
+#include "socket/LinuxSocket.h"
+#include "socket/SocketManager.h"
 
-# 线程池性能基准
-./cmake-build-release-wsl/test_thread_pool
+int main() {
+    Logger::getInstance().set_log_level(WARNING);
 
-# Redis 压力测试，需要先启动 Redis
-./cmake-build-relwithdebinfo-wsl/test_redis_bench 200000     # 默认发送 200000 条 SET
-./cmake-build-relwithdebinfo-wsl/test_redis_client_acc       # pipeline，1000 批 x 1000 条
+    auto context = std::make_shared<EpollContext>();
+    auto socket = SocketManager::getInstance().getSocket(context);
+
+    socket->bind("127.0.0.1", 8081);
+    socket->listen(ISocket::DEFAULT_BACKLOG);
+
+    std::vector<std::shared_ptr<ISocket>> clients;
+
+    socket->asyncAccept([&clients](std::shared_ptr<ISocket> client) {
+        if (auto c = std::static_pointer_cast<LinuxSocket>(client)) {
+            LOG(INFO) << "Client accept fd: " << c->getNative();
+        }
+        clients.push_back(client);
+        client->asyncRead([client](const std::string& buf, int size) -> int {
+            if (size == 0) {
+                LOG(INFO) << "client closed write, close socket";
+                client->close();
+                return 0;
+            }
+            // ECHO 回显
+            auto buffer = buf.substr(0, size);
+            client->asyncWriteOnce([](bool success) {
+                if (!success) LOG(ERR) << "writeOnce failed";
+            }, std::make_shared<std::string>(std::move(buffer)));
+            return size;
+        });
+    });
+
+    context->run(true); // 阻塞运行
+}
 ```
 
-# 测试结果(Benchmark Result)
+### 2. 高层客户端：交互式 Redis CLI
+```cpp
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <vector>
+#include "app/SimpleRedisClient.h"
+#include "logger/Logger.h"
 
-测试环境：WSL2 Ubuntu 20.04，Ultra7 265k + 32GB内存，`gcc-14 / g++-14`，Redis 5.0.14.1 运行于 Windows 侧 `127.0.0.1:6379`。
+std::vector<std::string> splitArgs(const std::string& line) {
+    std::vector<std::string> args;
+    std::istringstream iss(line);
+    std::string token;
+    while (iss >> token) args.push_back(std::move(token));
+    return args;
+}
 
-### 1. Redis pipeline 压力测试 / `test_redis_client_acc`
+int main() {
+    Logger::getInstance().set_log_level(WARNING);
+    SimpleRedisClient client;
+    if (!client.connect("127.0.0.1", 6379)) {
+        LOG(ERR) << "Connect failed";
+        return 1;
+    }
 
-SimpleRedisClient 4 条连接，每批 pipeline 深度 1000，共 1,000,000 条 `SET`：
+    std::cout << "Connected to Redis at 127.0.0.1:6379" << std::endl;
+    std::cout << "Type 'quit' or 'exit' to disconnect." << std::endl;
 
-| 指标 | 结果                 |
-| --- |--------------------|
-| 总命令数 Total commands | 1,000,000          |
-| 成功 Successful | 1,000,000          |
-| 失败 Failures | 0                  |
-| 耗时 Elapsed | 1.36 s              |
-| 吞吐 Throughput | **~733319 ops/s** |
+    std::string input;
+    while (true) {
+        std::cout << "redis> ";
+        if (!std::getline(std::cin, input)) {
+            std::cout << std::endl;
+            break;
+        }
+        if (input.empty()) continue;
+        if (input == "quit" || input == "exit") break;
 
-### 2. Redis 异步 SET 压力测试 / `test_redis_bench`
+        auto args = splitArgs(input);
+        if (args.empty()) continue;
 
-单连接加 epoll 异步读写，N = 200,000：
+        auto res = client.execute(args);
+        auto reply = res->get_future().get();
+        std::cout << formatResponse(reply) << std::endl;
+    }
+    std::cout << "Bye." << std::endl;
+    return 0;
+}
+```
+
+---
+
+## 目录结构
+```
+src/
+  app/          SimpleRedisClient、RESP 协议（redis.h）
+  net/          SocketManager、LinuxSocket、EpollContext
+  utils/        Logger、ThreadPool、SpinLock、无锁队列
+  main.cpp      epoll 异步版交互式客户端
+  redis_cli.cpp SimpleRedisClient 版交互式客户端
+test/
+  test_net/             网络框架基本测试
+  test_queue/           无锁队列性能测试
+  test_redis/
+      test_redis_bench.cpp         单连接 epoll 异步 SET 压力测试
+      test_redis_client_bench.cpp  pipeline 压力测试（SimpleRedisClient）
+      test_redis_parser.cpp         RESP 解析与异步集成正确性测试
+  test_thread_pool/
+      test_thread_pool_benchmark.cpp  线程池正确性与性能基准
+      test_thread_pool_result.cpp     线程池 Result 接口冒烟测试
+```
+
+---
+
+## 构建目标
+
+| 目标                        | 说明                                              |
+|---------------------------|-------------------------------------------------|
+| `main`                    | 交互式 Redis 客户端（epoll 异步版）                        |
+| `redis_cli`               | 交互式 Redis 客户端（SimpleRedisClient 版）              |
+| `test_redis_bench`        | SET 压力测试，参数为命令条数 N（默认 200000）                   |
+| `test_redis_client_acc`   | pipeline 压力测试，1000 批 × 1000 条，共 1,000,000 条 SET |
+| `test_redis_acc`          | RESP 解析正确性与异步集成测试                               |
+| `test_thread_pool`        | 线程池正确性与性能基准                                     |
+| `test_thread_pool_result` | 线程池 Result 接口冒烟测试                               |
+| `test_spsc_queue`         | 无锁队列性能基准测试                                      |
+| `test_echo_server`        | 简单的EchoServer实现                                 |
+
+---
+
+## 测试与基准结果
+**测试环境**：WSL2 Ubuntu 20.04，Ultra7 265k + 32GB 内存，GCC 14，Redis 5.0.14.1 运行于 Windows 侧（127.0.0.1:6379，未开启持久化）。
+
+### 1. pipeline 压力测试（`test_redis_client_acc`）
+SimpleRedisClient 使用 4 条连接，每批 pipeline 深度 1000，共发送 1,000,000 条 `SET`。
 
 | 指标 | 结果 |
 | --- | --- |
-| 发送命令 Commands sent | 200,000 |
+| 总命令数 | 1,000,000 |
+| 成功 | 1,000,000 |
+| 失败 | 0 |
+| 耗时 | 1.36 s |
+| 吞吐量 | **≈ 733,319 ops/s** |
+
+### 2. 异步 SET 压力测试（`test_redis_bench`）
+单连接 + epoll 异步读写，N = 200,000。
+
+| 指标 | 结果 |
+| --- | --- |
+| 发送命令 | 200,000 |
 | 成功 / 失败 | 200,000 / 0 |
-| 耗时 Elapsed | 1.19 s |
-| 吞吐 Throughput | **~167,421 req/s** |
-| 结果 | Stress test PASSED |
+| 耗时 | 1.19 s（含固定 1 秒轮询等待，实际传输时间更短） |
+| 吞吐量 | **≈ 167,421 req/s** |
+| 结论 | 压力测试通过 |
 
-> 说明：该测试的计时包含固定的 1 秒轮询等待，实际传输耗时远小于显示值；同一环境下多次运行的吞吐量约有 1% 波动。
+### 3. 线程池性能基准（Release 模式）
 
-### 3. 线程池性能基准 / `test_thread_pool`，Release
-
-| 场景 | 参数 | 耗时 | 吞吐 |
+| 场景 | 参数 | 耗时 | 吞吐量 |
 | --- | --- | --- | --- |
-| 空任务 Empty | 8 线程 x 1,000,000 任务 | 61.21 ms | ~16.3M tasks/s |
-| CPU 密集 | 8 线程 x 1,000,000 任务 x 100 次迭代 | 865.46 ms | ~1.16M tasks/s |
-| I/O 模拟，sleep 5ms | 8 线程 x 100 任务 | 66.48 ms | ~1,504 tasks/s |
-| 空任务最佳点 | 2 线程 x 100,000 任务 | 2.34 ms | ~42.8M tasks/s |
+| 空任务 | 8 线程 × 1,000,000 任务 | 61.21 ms | ~16.3M tasks/s |
+| CPU 密集型 | 8 线程 × 1,000,000 任务 × 100 次迭代 | 865.46 ms | ~1.16M tasks/s |
+| I/O 模拟（sleep 5ms） | 8 线程 × 100 任务 | 66.48 ms | ~1,504 tasks/s |
+| 空任务最佳点 | 2 线程 × 100,000 任务 | 2.34 ms | ~42.8M tasks/s |
 
-正确性测试覆盖 int、double、string、vector、异常、并发结果、边界值，全部 **PASSED**。
+**正确性测试**：覆盖 int、double、string、vector、异常、并发结果、边界值，全部通过。
 
-### 4. 正确性测试 / `test_redis_acc`
+### 4. 正确性测试（`test_redis_acc`）
+RESP 命令构建、响应解析与异步 Redis 集成测试全部通过，覆盖简单字符串、错误、整数、批量字符串、空值、数组、不完整数据等多种场景。
 
-RESP 命令构建、响应解析与异步 Redis 集成测试全部通过，覆盖简单字符串、错误、整数、批量字符串、空值、数组、不完整数据等场景。
+---
+
+## 已知限制
+
+### 当前限制
+- `SimpleRedisClient` **不维护客户端状态**，因此暂不支持 `MULTI`/`EXEC`、`SUBSCRIBE` 等需要上下文状态的命令。
+- 网络层目前仅支持 Linux / WSL2，无 Windows 原生支持。
+- 性能分析显示 `write` 系统调用和智能指针复制是主要瓶颈，有待进一步优化。
+---

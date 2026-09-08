@@ -11,7 +11,7 @@
 
 int main() {
 
-    Logger::getInstance().set_log_level(DEBUG);
+    Logger::getInstance().set_log_level(WARNING);
 
     auto context = std::make_shared<EpollContext>();
     auto socket = SocketManager::getInstance().getSocket(context);
@@ -35,9 +35,6 @@ int main() {
             }
 
             auto buffer = buf.substr(0, size);
-
-            std::cout << "recv: " << buffer << std::endl;
-
             client->asyncWriteOnce([](bool success) {
                 if (!success) {
                     LOG(ERR) << "writeOnce failed";
