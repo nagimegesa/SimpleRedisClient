@@ -212,7 +212,7 @@ SimpleRedisClient 使用 4 条连接，共发送 1,000,000 条 `SET`，发送完
 | 耗时 | 0.677078 s                       |
 | 吞吐量 | **≈ 1.47693e+06 req/s ≈ 1.47M ** |
 
-### 第三方（memtier_benchmark）测试结果
+### 3. memtier_benchmark测试结果
 测试结果吞吐大约 1.80M
 ```bash
 memtier_benchmark -s ${redis_ip} -p ${redis_port} -t 4  -c 4 -n 1000000 --ratio=1:0 -d 10 --pipeline=1000
@@ -241,7 +241,7 @@ Wall time:        8.632s
 Cores used:       0.767   (avg 19.2% across 4 worker threads)
 Peak utilization: 80.4%
 ```
-### 3. 线程池性能基准（Release 模式）
+### 4. 线程池性能基准
 
 | 场景 | 参数 | 耗时 | 吞吐量 |
 | --- | --- | --- | --- |
@@ -249,9 +249,6 @@ Peak utilization: 80.4%
 | CPU 密集型 | 8 线程 × 1,000,000 任务 × 100 次迭代 | 865.46 ms | ~1.16M tasks/s |
 | I/O 模拟（sleep 5ms） | 8 线程 × 100 任务 | 66.48 ms | ~1,504 tasks/s |
 | 空任务最佳点 | 2 线程 × 100,000 任务 | 2.34 ms | ~42.8M tasks/s |
-
-**正确性测试**：覆盖 int、double、string、vector、异常、并发结果、边界值，全部通过。
-
 ---
 
 ## 已知限制
