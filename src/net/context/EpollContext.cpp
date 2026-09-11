@@ -92,8 +92,10 @@ public:
 
     // 启动事件循环（在独立线程中运行）
     void start() {
-        running_ = true;
-        thread_ = std::thread([this] { run(); });
+        if (!running_) {
+            running_ = true;
+            thread_ = std::thread([this] { run(); });
+        }
     }
 
     // 停止事件循环（线程安全）
@@ -114,9 +116,12 @@ public:
             // std::lock_guard<std::mutex> lock(task_mutex_);
             task_queue_.push(std::move(task));
         }
-        // 唤醒 epoll_wait
-        uint64_t one = 1;
-        ::write(wakeup_fd_, &one, sizeof(one));
+
+        if (bool except = false; awake.compare_exchange_weak(except, true, std::memory_order_acq_rel)) {
+            // 唤醒 epoll_wait
+            uint64_t one = 1;
+            ::write(wakeup_fd_, &one, sizeof(one));
+        }
     }
 
 private:
@@ -164,11 +169,12 @@ private:
         //     tasks.front()();
         //     tasks.pop();
         // }
-
+        awake.store(false, std::memory_order_release);
         std::function<void()> task;
         while (task_queue_.pop(task) || (!running_ && !task_queue_.empty())) {
             task();
         }
+
     }
 
     void handleAccept(int fd) const {
@@ -488,6 +494,8 @@ private:
     int epoll_fd_;
     int wakeup_fd_;
     std::atomic<bool> running_{false};
+    alignas(std::hardware_constructive_interference_size)
+    std::atomic<bool> awake{false};
     std::thread thread_;
 
     std::unordered_map<int, std::shared_ptr<Connection>> connections_; // 仅在事件循环线程访问
@@ -495,6 +503,7 @@ private:
     // std::queue<std::function<void()>> task_queue_;                     // 待处理任务队列
     // std::mutex task_mutex_;                                            // 保护任务队列
     MPSCQueue<std::function<void()>, 4096> task_queue_;
+
 
     constexpr static int MAX_EVENTS = 2048;
     friend EpollContextImpl;

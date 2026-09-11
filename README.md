@@ -20,7 +20,6 @@
 - **操作系统**：Linux 或 WSL2（`EpollContext` 依赖 epoll，Windows 原生不支持）。
 - **编译器**：GCC 14 或更高版本（CMakeLists.txt 中已指定 `/usr/bin/gcc-14` 和 `/usr/bin/g++-14`）。
 - **构建工具**：CMake 3.10+。
-- **Redis 服务**：默认连接 `127.0.0.1:6379`，请确保 Redis 已启动。
 
 ### 编译
 ```bash
@@ -163,9 +162,9 @@ test/
   test_net/             网络框架基本测试
   test_queue/           无锁队列性能测试
   test_redis/
-      test_redis_bench.cpp         单连接 epoll 异步 SET 压力测试
-      test_redis_client_bench.cpp  pipeline 压力测试（SimpleRedisClient）
-      test_redis_parser.cpp         RESP 解析与异步集成正确性测试
+      test_redis_bench.cpp         epoll 异步 SET 压力测试，直接使用lowapi
+      test_redis_client_bench.cpp  pipeline 压力测试
+      test_redis_parser.cpp        RESP 解析与异步集成正确性测试
   test_thread_pool/
       test_thread_pool_benchmark.cpp  线程池正确性与性能基准
       test_thread_pool_result.cpp     线程池 Result 接口冒烟测试
@@ -175,45 +174,73 @@ test/
 
 ## 构建目标
 
-| 目标                        | 说明                                              |
-|---------------------------|-------------------------------------------------|
-| `main`                    | 交互式 Redis 客户端（epoll 异步版）                        |
-| `redis_cli`               | 交互式 Redis 客户端（SimpleRedisClient 版）              |
-| `test_redis_bench`        | SET 压力测试，参数为命令条数 N（默认 200000）                   |
-| `test_redis_client_acc`   | pipeline 压力测试，1000 批 × 1000 条，共 1,000,000 条 SET |
-| `test_redis_acc`          | RESP 解析正确性与异步集成测试                               |
-| `test_thread_pool`        | 线程池正确性与性能基准                                     |
-| `test_thread_pool_result` | 线程池 Result 接口冒烟测试                               |
-| `test_spsc_queue`         | 无锁队列性能基准测试                                      |
-| `test_echo_server`        | 简单的EchoServer实现                                 |
+| 目标                        | 说明                                                                 |
+|---------------------------|--------------------------------------------------------------------|
+| `main`                    | 交互式 Redis 客户端（epoll 异步版）                                           |
+| `redis_cli`               | 交互式 Redis 客户端（SimpleRedisClient 版）                                 |
+| `test_redis_bench`        | SET 压力测试，连续 1,000,000 条 SET，和 test_redis_client_acc 区别是不走封装的client |
+| `test_redis_client_acc`   | pipeline 压力测试，连续 1,000,000 条 SET                                   |
+| `test_redis_acc`          | RESP 解析正确性与异步集成测试                                                  |
+| `test_thread_pool`        | 线程池正确性与性能基准                                                        |
+| `test_thread_pool_result` | 线程池 Result 接口冒烟测试                                                  |
+| `test_spsc_queue`         | 无锁队列性能基准测试                                                         |
+| `test_echo_server`        | 简单的EchoServer实现                                                    |
 
 ---
 
 ## 测试与基准结果
-**测试环境**：WSL2 Ubuntu 20.04，Ultra7 265k + 32GB 内存，GCC 14，Redis 5.0.14.1 运行于 Windows 侧（127.0.0.1:6379，未开启持久化）。
+**测试环境**：WSL2 Ubuntu 20.04，Ultra7 265k + 32GB 内存，GCC 14，Redis 6.0.16 运行于远程 k8s docker 容器，未开启持久化。
 
 ### 1. pipeline 压力测试（`test_redis_client_acc`）
-SimpleRedisClient 使用 4 条连接，每批 pipeline 深度 1000，共发送 1,000,000 条 `SET`。
+SimpleRedisClient 使用 4 条连接，共发送 1,000,000 条 `SET`，发送完所有指令后统一接收返回数据。
 
-| 指标 | 结果 |
-| --- | --- |
-| 总命令数 | 1,000,000 |
-| 成功 | 1,000,000 |
-| 失败 | 0 |
-| 耗时 | 1.36 s |
-| 吞吐量 | **≈ 733,319 ops/s** |
+| 指标 | 结果                             |
+| --- |--------------------------------|
+| 总命令数 | 1,000,000                      |
+| 成功 | 1,000,000                      |
+| 失败 | 0                              |
+| 耗时 | 1.36 s                         |
+| 吞吐量 | **≈ 1.12109e+06 ops/s≈ 1.21M** |
 
 ### 2. 异步 SET 压力测试（`test_redis_bench`）
-单连接 + epoll 异步读写，N = 200,000。
+4连接 + epoll 异步读写，N = 1,000,000。
 
-| 指标 | 结果 |
-| --- | --- |
-| 发送命令 | 200,000 |
-| 成功 / 失败 | 200,000 / 0 |
-| 耗时 | 1.19 s（含固定 1 秒轮询等待，实际传输时间更短） |
-| 吞吐量 | **≈ 167,421 req/s** |
-| 结论 | 压力测试通过 |
+| 指标 | 结果                               |
+| --- |----------------------------------|
+| 发送命令 | 1,000,000                        |
+| 成功 / 失败 | 1,000,000 / 0                    |
+| 耗时 | 0.677078 s                       |
+| 吞吐量 | **≈ 1.47693e+06 req/s ≈ 1.47M ** |
 
+### 第三方（memtier_benchmark）测试结果
+测试结果吞吐大约 1.80M
+```bash
+memtier_benchmark -s ${redis_ip} -p ${redis_port} -t 4  -c 4 -n 1000000 --ratio=1:0 -d 10 --pipeline=1000
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 11%,   0 secs]  4 threads  4 conns:     1837059 ops, 1837744 (avg: 1837744) ops/sec, 99.70MB/sec (avg: 99.70MB/s[RUN #1 24%,   1 secs]  4 threads  4 conns:     3781027 ops, 1943775 (avg: 1890772) ops/sec, 105.46MB/sec (avg: 102.58MB[RUN #1 36%,   2 secs]  4 threads  4 conns:     5721070 ops, 1939854 (avg: 1907135) ops/sec, 105.25MB/sec (avg: 103.47MB[RUN #1 48%,   3 secs]  4 threads  4 conns:     7609985 ops, 1888682 (avg: 1902521) ops/sec, 102.47MB/sec (avg: 103.22MB[RUN #1 59%,   5 secs]  4 threads  4 conns:     9485104 ops, 1874888 (avg: 1896994) ops/sec, 101.72MB/sec (avg: 102.92MB[RUN #1 71%,   6 secs]  4 threads  4 conns:    11323404 ops, 1838106 (avg: 1887179) ops/sec, 99.73MB/sec (avg: 102.39MB/[RUN #1 82%,   7 secs]  4 threads  4 conns:    13141903 ops, 1818295 (avg: 1877338) ops/sec, 98.65MB/sec (avg: 101.85MB/[RUN #1 93%,   8 secs]  4 threads  4 conns:    14895801 ops, 1753689 (avg: 1861880) ops/sec, 95.14MB/sec (avg: 101.01MB/[RUN #1 100%,   8 secs]  0 threads  4 conns:    16000000 ops, 1753689 (avg: 1874795) ops/sec, 95.14MB/sec (avg: 101.71MB/sec),  9.07 (avg:  8.50) msec latency
+
+4         Threads
+4         Connections per thread
+1000000   Requests per client
+
+
+ALL STATS
+============================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency       KB/sec
+----------------------------------------------------------------------------------------------------------------------------
+Sets      1870534.90          ---          ---         8.49588         8.12700        11.83900        24.44700    103918.31
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00
+Waits           0.00          ---          ---             ---             ---             ---             ---          ---
+Totals    1870534.90         0.00         0.00         8.49588         8.12700        11.83900        24.44700    103918.31
+
+CPU Utilization Summary
+Total CPU time:   6.622s  (user 5.875s, sys 0.746s)
+Wall time:        8.632s
+Cores used:       0.767   (avg 19.2% across 4 worker threads)
+Peak utilization: 80.4%
+```
 ### 3. 线程池性能基准（Release 模式）
 
 | 场景 | 参数 | 耗时 | 吞吐量 |
@@ -225,9 +252,6 @@ SimpleRedisClient 使用 4 条连接，每批 pipeline 深度 1000，共发送 1
 
 **正确性测试**：覆盖 int、double、string、vector、异常、并发结果、边界值，全部通过。
 
-### 4. 正确性测试（`test_redis_acc`）
-RESP 命令构建、响应解析与异步 Redis 集成测试全部通过，覆盖简单字符串、错误、整数、批量字符串、空值、数组、不完整数据等多种场景。
-
 ---
 
 ## 已知限制
@@ -235,5 +259,39 @@ RESP 命令构建、响应解析与异步 Redis 集成测试全部通过，覆�
 ### 当前限制
 - `SimpleRedisClient` **不维护客户端状态**，因此暂不支持 `MULTI`/`EXEC`、`SUBSCRIBE` 等需要上下文状态的命令。
 - 网络层目前仅支持 Linux / WSL2，无 Windows 原生支持。
-- 性能分析显示 `write` 系统调用和智能指针复制是主要瓶颈，有待进一步优化。
+- ~~性能分析显示 `write` 系统调用和智能指针复制是主要瓶颈，有待进一步优化。~~
+  1. write的性能瓶颈集中在postTask函数中每一次提交任务都需要唤醒epoll线程，所以加入了一个变量判断是否已经唤醒线程，配合writev，和扩大系统写缓冲区，将瓶颈消除
+- 目前性能分析显示，主要的瓶颈在智能指针以及内存分配
+    ```bash
+    Total: 355 samples
+           1   0.3%   0.3%      183  51.5% EventLoopThread::run
+           0   0.0%   0.3%      183  51.5% clone
+           0   0.0%   0.3%      183  51.5% start_thread
+           0   0.0%   0.3%      183  51.5% std::error_code::default_error_condition
+           0   0.0%   0.3%      172  48.5% __libc_start_main
+           0   0.0%   0.3%      172  48.5% _start
+           0   0.0%   0.3%      172  48.5% main
+           0   0.0%   0.3%      172  48.5% pipeline_stress_test
+           1   0.3%   0.6%      136  38.3% SimpleRedisClient::execute
+           1   0.3%   0.8%      121  34.1% SimpleRedisClient::ClientImpl::execute
+           0   0.0%   0.8%       87  24.5% std::function::operator (inline)
+           1   0.3%   1.1%       78  22.0% LinuxSocket::asyncWriteOnce
+           0   0.0%   1.1%       74  20.8% EpollContextImpl::asyncWriteOnce
+           0   0.0%   1.1%       60  16.9% EventLoopThread::handleRead
+           1   0.3%   1.4%       55  15.5% SimpleRedisClient::ClientImpl::read [clone .isra.0]
+           0   0.0%   1.4%       51  14.4% EventLoopThread::postTask (inline)
+          44  12.4%  13.8%       46  13.0% epoll_wait
+           8   2.3%  16.1%       45  12.7% std::__shared_ptr::__shared_ptr (inline)
+           0   0.0%  16.1%       45  12.7% std::shared_ptr::shared_ptr (inline)
+           0   0.0%  16.1%       44  12.4% __libc_write
+          43  12.1%  28.2%       44  12.4% __libc_write (inline)
+           0   0.0%  28.2%       40  11.3% std::allocator_traits::construct (inline)
+          12   3.4%  31.5%       40  11.3% std::function::function (inline)
+           1   0.3%  31.8%       38  10.7% EventLoopThread::drainTasks
+           1   0.3%  32.1%       37  10.4% std::__shared_count::__shared_count (inline)
+           4   1.1%  33.2%       32   9.0% EventLoopThread::handleWrite
+           0   0.0%  33.2%       32   9.0% std::__new_allocator::allocate (inline)
+           0   0.0%  33.2%       32   9.0% std::allocator::allocate (inline)
+           0   0.0%  33.2%       32   9.0% std::allocator_traits::allocate (inline)
+    ```
 ---

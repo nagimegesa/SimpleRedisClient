@@ -170,6 +170,11 @@ void LinuxSocket::setNoBlock() {
     if (setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable)) < 0) {
         LOG(ERR) <<"setsockopt TCP_NODELAY failed";
     }
+
+    int buffer = 4096 * 2;
+    if (setsockopt( socket_fd, SOL_SOCKET, SO_SNDBUF, &buffer, sizeof( buffer ) )) {
+        LOG(ERR) << "setsockopt SO_SNDBUF failed";
+    }
 }
 
 int LinuxSocket::getNative() const {

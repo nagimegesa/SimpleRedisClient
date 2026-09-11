@@ -34,7 +34,10 @@ public:
 
     void close() {
         closed = true;
-        writer_thread.join();
+        if (writer_thread.joinable()) {
+            writer_thread.join();
+        }
+
         this->stream_.flush();
         this->stream_.close();
     }

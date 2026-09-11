@@ -56,7 +56,7 @@ void pipeline_stress_test() {
             promises.push_back(client.execute({"SET", key, value}));
         }
 
-        if ((batch + 1) % 10 == 0) {
+        if ((batch + 1) % 100 == 0) {
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - start).count();
             std::cout << "  Batch " << (batch + 1) << "/" << TOTAL_BATCHES
@@ -89,7 +89,6 @@ void pipeline_stress_test() {
 }
 
 int main() {
-    // 关闭调试日志（避免影响性能）
     Logger::getInstance().set_log_level(WARNING);
     pipeline_stress_test();
     return 0;

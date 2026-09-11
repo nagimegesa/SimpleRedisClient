@@ -12,112 +12,143 @@
 #include "redis.h"
 
 int main(int argc, char* argv[]) {
-    int N = (argc > 1) ? std::stoi(argv[1]) : 200000;
-
-    // 设置为 DEBUG 以便看到框架的 ERR 日志（比如连接关闭、读写错误等）
-    Logger::getInstance().set_log_level(DEBUG);
-
-    auto context = std::make_shared<EpollContext>();
-    auto socket = SocketManager::getInstance().getSocket(context);
-    if (!socket->connect("127.0.0.1", 6379)) {
-        std::cerr << "Failed to connect to Redis\n";
+    int N = (argc > 1) ? std::stoi(argv[1]) : 1000000;
+    int T = (argc > 2) ? std::stoi(argv[2]) : 4;   // 线程数，默认 4
+    if (T <= 0) T = 1;
+    if (N <= 0) {
+        std::cerr << "N must be positive\n";
         return 1;
     }
 
+    const std::string host = "127.0.0.1";
+    const unsigned short port = 6379;
 
-
-    std::atomic<int> success_count{0};
-    std::atomic<int> fail_count{0};
-    std::atomic<int> write_success{0};
-    std::atomic<int> write_fail{0};
-    std::atomic<bool> all_done{false};
-
-    int count = 0;
-    context->registerAsyncRead(socket, [&](const std::string& buf, size_t size) -> size_t {
-        size_t pos = 0;
-        int parsed = 0;
-        while (pos < size) {
-            size_t start_pos = pos;  // 记录当前响应的起始位置
-            try {
-                RESPValue result = RESP_Parser::parse(buf, pos);
-                parsed++;
-                if (result.type == RESPType::SimpleString && result.as_string() == "OK") {
-                    ++success_count;
-                } else {
-                    LOG(DEBUG) << "Unexpected response: " << result.as_string();
-                    ++fail_count;
-                }
-                if (success_count.load() + fail_count.load() >= N) {
-                    all_done = true;
-                }
-            } catch (const IncompleteRESPException&) {
-                // 数据不完整，回退到该响应开头，并停止解析
-                pos = start_pos;
-                break;
-            } catch (const std::exception& e) {
-                // 其他解析错误（如数据损坏），尝试跳过当前字符继续解析（避免死循环）
-                LOG(ERR) << "Parse error: " << e.what() << ", skipping one byte";
-                ++fail_count;
-                pos = start_pos + 1;  // 跳过出错的字符
-                // 也可直接返回 pos（清空缓冲区），但丢失后续数据风险更大
-                if (success_count.load() + fail_count.load() >= N) all_done = true;
-            }
-        }
-        // LOG(DEBUG) << "Read callback: parsed " << parsed
-        //            << " responses, consumed " << pos << " bytes, buffer size " << size;
-        return pos;
-    });
-    context->run();  // 启动事件循环线程
+    // 全局统计
+    std::atomic<int> total_success{0};
+    std::atomic<int> total_fail{0};
+    std::atomic<int> total_write_success{0};
+    std::atomic<int> total_write_fail{0};
 
     auto start = std::chrono::steady_clock::now();
 
-    // 发送 N 条 SET 命令
-    for (int i = 0; i < N; ++i) {
-        std::string key = "stress_key_" + std::to_string(i);
-        std::string value = "stress_value_" + std::to_string(i);
-        std::vector<std::string> args = {"SET", key, value};
-        std::string cmd = buildRESPCommand(args);
+    std::vector<std::thread> threads;
+    threads.reserve(T);
 
-        context->asyncWriteOnce(socket,
-            [&](bool ok) {
-                if (ok) {
-                    ++write_success;
-                } else {
-                    ++write_fail;
-                    LOG(ERR) << "Write callback failed for command #" << i;
+    auto context = std::make_shared<EpollContext>();
+    context->run();  // 启动本线程的事件循环线程
+
+    for (int t = 0; t < T; ++t) {
+        // 把 N 条命令尽量平均分给 T 个线程
+        int per_thread = N / T + (t < N % T ? 1 : 0);
+        if (per_thread == 0) continue;
+
+        threads.emplace_back([&, t, per_thread]() {
+            // 每个线程独立创建一个事件循环和 socket
+
+            auto socket = SocketManager::getInstance().getSocket(context);
+
+            if (!socket->connect(host.c_str(), port)) {
+                std::cerr << "Thread " << t << " failed to connect to Redis\n";
+                total_write_fail += per_thread;
+                return;
+            }
+
+            // 本线程内的统计
+            std::atomic<int> success_count{0};
+            std::atomic<int> fail_count{0};
+            std::atomic<int> write_success{0};
+            std::atomic<int> write_fail{0};
+            std::atomic<bool> all_done{false};
+
+            // 注册读回调
+            context->registerAsyncRead(socket, [&](const std::string& buf, size_t size) -> size_t {
+                size_t pos = 0;
+                while (pos < size) {
+                    size_t start_pos = pos;
+                    RESPValue result;
+                    try {
+                        result = RESP_Parser::parse(buf, pos);
+                        ++success_count;
+
+                        if (success_count + fail_count >= per_thread) {
+                            all_done = true;
+                        }
+                    } catch (const IncompleteRESPException&) {
+                        pos = start_pos;
+                        break;
+                    } catch (const std::exception& e) {
+                        pos = start_pos + 1;
+                        ++fail_count;
+                        LOG(ERR) << "Thread " << t << " parse error: " << e.what();
+                        if (success_count + fail_count >= per_thread) {
+                            all_done = true;
+                        }
+                        break;
+                    }
                 }
-            },
-            std::make_shared<std::string>(std::move(cmd)));
+                return pos;
+            });
 
-        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // 发送本线程负责的命令
+            for (int i = 0; i < per_thread; ++i) {
+                std::string key = "stress_key_" + std::to_string(t) + "_" + std::to_string(i);
+                std::string value = "stress_value_" + std::to_string(t) + "_" + std::to_string(i);
+                std::vector<std::string> args = {"SET", key, value};
+                std::string cmd = buildRESPCommand(args);
+
+                context->asyncWriteOnce(socket,
+                    [&, i](bool ok) {
+                        if (ok) {
+                            ++write_success;
+                        } else {
+                            ++write_fail;
+                            ++fail_count;   // 写失败相当于该命令没有响应
+                            LOG(ERR) << "Thread " << t << " write failed for command #" << i;
+                            if (success_count + fail_count >= per_thread) {
+                                LOG(INFO) << "Write success: " << write_success.load() << "\n";
+                            }
+                        }
+                    },
+                    std::make_shared<std::string>(std::move(cmd)));
+            }
+
+            // 等待本线程所有响应收完
+            while (!all_done) {
+            }
+
+            // 汇总到全局
+            total_success += success_count.load();
+            total_fail += fail_count.load();
+            total_write_success += write_success.load();
+            total_write_fail += write_fail.load();
+
+            socket->close();
+        });
     }
 
-    // 等待响应，每秒钟打印进度
-    int timeout_seconds = 30;
-    while (!all_done.load() && timeout_seconds-- > 0) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        LOG(DEBUG) << "Waiting... responses=" << (success_count.load()+fail_count.load())
-                   << ", write_success=" << write_success.load()
-                   << ", write_fail=" << write_fail.load();
+    for (auto& th : threads) {
+        th.join();
     }
+
+    context->close();
 
     auto end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(end - start).count();
 
-    int total_received = success_count.load() + fail_count.load();
+    int total_received = total_success.load() + total_fail.load();
+
     std::cout << "\n===== Stress Test Results =====\n";
+    std::cout << "Threads:            " << T << "\n";
     std::cout << "Commands sent:      " << N << "\n";
     std::cout << "Responses received: " << total_received << "\n";
-    std::cout << "Success:            " << success_count.load() << "\n";
-    std::cout << "Failures:           " << fail_count.load() << "\n";
-    std::cout << "Write success:      " << write_success.load() << "\n";
-    std::cout << "Write failures:     " << write_fail.load() << "\n";
+    std::cout << "Success:            " << total_success.load() << "\n";
+    std::cout << "Failures:           " << total_fail.load() << "\n";
+    std::cout << "Write success:      " << total_write_success.load() << "\n";
+    std::cout << "Write failures:     " << total_write_fail.load() << "\n";
     std::cout << "Elapsed time:       " << elapsed << " seconds\n";
     std::cout << "Throughput:         " << (elapsed > 0 ? N / elapsed : 0) << " req/s\n";
 
-    socket->close();
-
-    if (total_received != N || fail_count.load() > 0 || write_fail.load() > 0) {
+    if (total_received != N || total_fail.load() > 0 || total_write_fail.load() > 0) {
         std::cerr << "Stress test FAILED\n";
         return 1;
     }
