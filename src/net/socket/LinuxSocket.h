@@ -29,6 +29,10 @@ public:
         const WriteContextCallBack&         callback,
         const std::shared_ptr<std::string>& buf
     ) override;
+
+    void registerLowLevelCallback(const LowLevelCallback& callback) override;
+    void registerHighLevelCallback(const HighLevelCallback& callback) override;
+
     void setNoBlock() override;
     int getNative() const;
 };

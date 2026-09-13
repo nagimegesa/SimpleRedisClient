@@ -30,6 +30,8 @@ public:
     void registerAsyncRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) const;
     void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback, const std::shared_ptr<std::string>& buf) const;
     void removeSocket(const std::shared_ptr<ISocket>& socket) const;
+    void registerHighLevelCallback(const std::shared_ptr<ISocket>& socket, const HighLevelCallback& callback) const;
+    void registerLowLevelCallback(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) const;
     void run(bool block=false) const;
     void close() const;
 

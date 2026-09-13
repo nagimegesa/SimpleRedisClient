@@ -41,10 +41,13 @@ struct Connection {
     SimpleBuffer read_buffer;                 // 读缓冲区
     // std::queue<WriteMetaInfo> write_queue;    // 写队列
     std::deque<WriteMetaInfo> write_queue;
+    int in_queue_write_buffer_byte_size = 0;
+    HighLevelCallback high_level_callback;
+    LowLevelCallback low_level_callback;
+    bool high_level_callback_set = false;
     bool read_registered = false;             // 是否已注册 EPOLLIN
     bool write_registered = false;            // 是否已注册 EPOLLOUT
     bool peer_closed_ = false;                // 对端是否已关闭写端（收到 FIN）
-
     Connection(std::shared_ptr<ISocket> s, ReadContextCallBack cb)
         : socket(std::move(s)), read_cb(std::move(cb)) {
         read_buffer.resize(DEFAULT_BUFFER_SIZE);
@@ -90,7 +93,7 @@ public:
         if (wakeup_fd_ != -1) ::close(wakeup_fd_);
     }
 
-    // 启动事件循环（在独立线程中运行）
+    // 启动事件循环
     void start() {
         if (!running_) {
             running_ = true;
@@ -98,9 +101,9 @@ public:
         }
     }
 
-    // 停止事件循环（线程安全）
+    // 停止事件循环
     void stop() {
-        if (running_.exchange(false)) {
+        if(running_.exchange(false)) {
             // 唤醒 epoll_wait
             uint64_t one = 1;
             ::write(wakeup_fd_, &one, sizeof(one));
@@ -110,11 +113,11 @@ public:
         }
     }
 
-    // 提交任务到本线程的事件循环（线程安全）
+    // 提交任务到本线程的事件循环
     void postTask(std::function<void()> task) {
         {
             // std::lock_guard<std::mutex> lock(task_mutex_);
-            task_queue_.push(std::move(task));
+            while (!task_queue_.push(std::move(task))) {} // push 可能返回 False 需要不断尝试
         }
 
         if (bool except = false; awake.compare_exchange_weak(except, true, std::memory_order_acq_rel)) {
@@ -157,6 +160,15 @@ private:
                 }
             }
         }
+
+        std::function<void()> task; // 关闭的时候清空任务
+        while (!task_queue_.empty()) {
+            if (task_queue_.pop(task)) {
+                task();
+            }
+        }
+
+        LOG(DEBUG) << "EventLoopThread: closed";
     }
 
     void drainTasks() {
@@ -171,10 +183,10 @@ private:
         // }
         awake.store(false, std::memory_order_release);
         std::function<void()> task;
-        while (task_queue_.pop(task) || (!running_ && !task_queue_.empty())) {
+
+        while (task_queue_.pop(task)) {
             task();
         }
-
     }
 
     void handleAccept(int fd) const {
@@ -240,7 +252,9 @@ private:
             }
             // 通知上层应用是否处理对端关闭
             // 因为上层可能直接关闭连接所以最后调用
-            conn->read_cb(conn->read_buffer.buffer, 0);
+            if (conn->read_cb) {
+                conn->read_cb(conn->read_buffer.buffer, 0);
+            }
         } else { // ret < 0
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // 暂时无数据，忽略，等待下次 epoll 触发
@@ -293,9 +307,7 @@ private:
         std::size_t total_size = 0;
 
         std::vector<iovec> iovs;
-        std::vector<std::size_t> write_size_sum {};
         iovs.reserve(write_count);
-        write_size_sum.reserve(write_count);
 
         for (int i = 0; i < write_count; ++i) {
             ::iovec iov{};
@@ -307,7 +319,6 @@ private:
             }
 
             total_size += iov.iov_len;
-            write_size_sum.push_back(total_size);
         }
 
         if (iovs.empty()) {
@@ -328,6 +339,13 @@ private:
         }
 
         auto remaining = static_cast<size_t>(n);
+
+        conn->in_queue_write_buffer_byte_size -= static_cast<int>(remaining);
+        if (conn->in_queue_write_buffer_byte_size < 0) {
+            LOG(WARNING) << "EventLoopThread: in_queue_write_buffer_byte_size " << conn->in_queue_write_buffer_byte_size;
+            conn->in_queue_write_buffer_byte_size = 0;
+        }
+
         while (!conn->write_queue.empty() && remaining > 0) {
             auto& meta = conn->write_queue.front();
             size_t unSent = meta.buffer->size() - meta.offset;
@@ -359,6 +377,14 @@ private:
                 }
             }
         }
+
+        // 低水位回调
+        if (conn->high_level_callback_set && conn->in_queue_write_buffer_byte_size < ISocket::DEFAULT_LOW_LEVEL_SIZE) {
+            if (conn->low_level_callback) {
+                conn->high_level_callback_set = false;
+                conn->low_level_callback(conn->socket);
+            }
+        }
     }
 
     void failAllPendingWrites(const std::shared_ptr<Connection>& conn) {
@@ -371,6 +397,7 @@ private:
                 }
                 conn->write_queue.pop_front();
             }
+            conn->in_queue_write_buffer_byte_size = 0;
         }
     }
 
@@ -469,7 +496,17 @@ public:
         // 这里可以使用 & 是因为 不可能出现 conn 被移除的情况
         // 因为 removeSocket 不可能在这个函数内被调用
         auto& conn = it->second;
+        int size = static_cast<int>(buf->size());
         conn->write_queue.emplace_back(socket, callback, buf);
+
+        // 高水位背压
+        conn->in_queue_write_buffer_byte_size += size;
+        if (conn->in_queue_write_buffer_byte_size > ISocket::DEFAULT_HIGH_LEVEL_SIZE) {
+            if (conn->high_level_callback && !conn->high_level_callback_set) {
+                conn->high_level_callback_set = true;
+                conn->high_level_callback(conn->socket);
+            }
+        }
 
         // 如果尚未注册写事件，则修改 epoll
         if (!conn->write_registered) {
@@ -480,6 +517,28 @@ public:
                 modifyEpollEvents(fd, EPOLLOUT);
             }
         }
+    }
+
+    void doRegisterHighLevelCallback(int fd, const HighLevelCallback& callback) {
+        auto it = connections_.find(fd);
+        if (it == connections_.end()) {
+            LOG(WARNING) << "EventLoopThread: try register a callback for unknown socket " << fd;
+            return;
+        }
+
+        auto& conn = it->second;
+        conn->high_level_callback = callback;
+    }
+
+    void doRegisterLowLevelCallback(int fd, const LowLevelCallback& callback) {
+        auto it = connections_.find(fd);
+        if (it == connections_.end()) {
+            LOG(WARNING) << "EventLoopThread: try register a callback for unknown socket " << fd;
+            return;
+        }
+
+        auto& conn = it->second;
+        conn->low_level_callback = callback;
     }
 
     void doClose(int fd) {
@@ -512,13 +571,28 @@ private:
 // ------------------------- EpollContext::Impl -------------------------
 struct EpollContextImpl {
 
-    static constexpr int loop_size = 4;
+    static constexpr int LOOP_SIZE = 4;
     std::vector<std::unique_ptr<EventLoopThread>> loops_;
+
+    static bool checkSocket(const std::shared_ptr<ISocket>& socket, int& fd) {
+        if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
+            fd = sc->getNative();
+            if (fd == -1) {
+                LOG(ERR) << "EpollContext: invalid socket fd";
+                return false;
+            }
+        } else {
+            LOG(ERR) << "EpollContext: socket not available";
+            return false;
+        }
+
+        return true;
+    }
+
 public:
     EpollContextImpl() {
-        // 创建两个事件循环线程（可根据需要调整）
-        loops_.reserve(loop_size);
-        for (int i = 0; i < loop_size; ++i) {
+        loops_.reserve(LOOP_SIZE);
+        for (int i = 0; i < LOOP_SIZE; ++i) {
             loops_.emplace_back(std::make_unique<EventLoopThread>());
         }
     }
@@ -531,12 +605,7 @@ public:
     }
 
     void registerAccept(const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) {
-        if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
-            int fd = sc->getNative();
-            if (fd == -1) {
-                LOG(ERR) << "EpollContext: invalid socket fd";
-                return;
-            }
+        if (int fd = -1; checkSocket(socket, fd)) {
             // 根据 fd 哈希选择事件循环线程
             size_t index = std::hash<int>{}(fd) % loops_.size();
             // 提交任务到对应线程
@@ -544,17 +613,12 @@ public:
                 loops_[index]->doRegisterAccept(fd, socket, callback);
             });
         } else {
-            LOG(ERR) << "EpollContext is only for linux socket";
+            LOG(ERR) << "registerAccept failed";
         }
     }
 
     void registerRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) {
-        if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
-            int fd = sc->getNative();
-            if (fd == -1) {
-                LOG(ERR) << "EpollContext: invalid socket fd";
-                return;
-            }
+        if (int fd = -1; checkSocket(socket, fd)) {
             // 根据 fd 哈希选择事件循环线程
             size_t index = std::hash<int>{}(fd) % loops_.size();
             // 提交任务到对应线程
@@ -562,42 +626,31 @@ public:
                 loops_[index]->doRegisterRead(fd, socket, callback);
             });
         } else {
-            LOG(ERR) << "EpollContext is only for linux socket";
+            LOG(ERR) << "registerRead failed";
         }
     }
 
     void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback,
                         const std::shared_ptr<std::string>& buf) {
-        if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
-            int fd = sc->getNative();
-            if (fd == -1) {
-                LOG(ERR) << "EpollContext: invalid socket fd";
-                if (callback) callback(false);
-                return;
-            }
+        if (int fd = -1; checkSocket(socket, fd)) {
             size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask([this, index, fd, socket, callback, buf] {
                 loops_[index]->doAsyncWriteOnce(fd, socket, callback, buf);
             });
         } else {
-            LOG(ERR) << "EpollContext is only for linux socket";
+            LOG(ERR) << "async write failed";
             if (callback) callback(false);
         }
     }
 
     void removeSocket(const std::shared_ptr<ISocket>& socket) {
-        if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
-            int fd = sc->getNative();
-            if (fd == -1) {
-                LOG(ERR) << "EpollContext: invalid socket fd";
-                return;
-            }
+        if (int fd = -1; checkSocket(socket, fd)) {
             size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask([this, index, fd] {
                 loops_[index]->doClose(fd);
             });
         } else {
-            LOG(ERR) << "EpollContext is only for linux socket";
+            LOG(ERR) << "removeSocket failed";
         }
     }
 
@@ -621,6 +674,23 @@ public:
         }
     }
 
+    void registerHighLevel(const std::shared_ptr<ISocket>& socket, const HighLevelCallback& callback) {
+        if (int fd = -1; checkSocket(socket, fd)) {
+            size_t index = std::hash<int>{}(fd) % loops_.size();
+            loops_[index]->postTask([this, index, fd, callback] {
+                loops_[index]->doRegisterHighLevelCallback(fd, callback);
+            });
+        }
+    }
+
+    void registerLowLevel(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) {
+        if (int fd = -1; checkSocket(socket, fd)) {
+            size_t index = std::hash<int>{}(fd) % loops_.size();
+            loops_[index]->postTask([this, index, fd, callback] {
+               loops_[index]->doRegisterLowLevelCallback(fd, callback);
+            });
+        }
+    }
 };
 
 EpollContext::EpollContext() : impl(std::make_unique<EpollContextImpl>()) {}
@@ -642,6 +712,20 @@ void EpollContext::asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const 
 
 void EpollContext::removeSocket(const std::shared_ptr<ISocket>& socket) const {
     impl->removeSocket(socket);
+}
+
+void EpollContext::registerHighLevelCallback(
+    const std::shared_ptr<ISocket>& socket,
+    const HighLevelCallback& callback
+) const {
+    impl->registerHighLevel(socket, callback);
+}
+
+void EpollContext::registerLowLevelCallback(
+    const std::shared_ptr<ISocket>& socket,
+    const LowLevelCallback& callback
+) const {
+    impl->registerLowLevel(socket, callback);
 }
 
 void EpollContext::run(bool block) const {

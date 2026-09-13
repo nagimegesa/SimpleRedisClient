@@ -10,6 +10,8 @@
 #include <arpa/inet.h>
 #include <memory>
 #include <string>
+#include <tbb/internal/_template_helpers.h>
+
 #include "context/EpollContext.h"
 
 LinuxSocket::LinuxSocket(const std::shared_ptr<EpollContext>& epoll_context) : ISocket(epoll_context) {
@@ -157,6 +159,22 @@ void LinuxSocket::asyncWriteOnce(
     }
 }
 
+void LinuxSocket::registerLowLevelCallback(const LowLevelCallback& callback) {
+    if (auto context = epollContext_.lock()) {
+        context->registerLowLevelCallback(shared_from_this(), callback);
+    } else {
+        LOG(ERR) << "LinuxSocket::registerLowLevelCallback: epollContext is nullptr";
+    }
+}
+
+void LinuxSocket::registerHighLevelCallback(const HighLevelCallback& callback) {
+    if (auto context = epollContext_.lock()) {
+        context->registerHighLevelCallback(shared_from_this(), callback);
+    } else {
+        LOG(ERR) << "LinuxSocket::registerHighLevelCallback: epollContext is nullptr";
+    }
+}
+
 void LinuxSocket::setNoBlock() {
     int flags = ::fcntl(socket_fd, F_GETFL, 0);
     if (flags == -1) {
@@ -166,14 +184,18 @@ void LinuxSocket::setNoBlock() {
     if (::fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         LOG(ERR) << "fcntl F_SETFL failed";
     }
+
     int enable = 1;
     if (setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable)) < 0) {
         LOG(ERR) <<"setsockopt TCP_NODELAY failed";
     }
 
-    int buffer = 4096 * 2;
-    if (setsockopt( socket_fd, SOL_SOCKET, SO_SNDBUF, &buffer, sizeof( buffer ) )) {
+    if (setsockopt( socket_fd, SOL_SOCKET, SO_SNDBUF, &ISocket::DEFAULT_SEND_BUFFER_SIZE, sizeof( ISocket::DEFAULT_SEND_BUFFER_SIZE ) )) {
         LOG(ERR) << "setsockopt SO_SNDBUF failed";
+    }
+
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVBUF, &ISocket::DEFAULT_RECV_BUFFER_SIZE, sizeof( ISocket::DEFAULT_RECV_BUFFER_SIZE ) )) {
+        LOG(ERR) << "setsockopt SO_RCVBUF failed";
     }
 }
 

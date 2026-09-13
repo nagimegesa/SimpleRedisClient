@@ -60,7 +60,7 @@ public:
                 return false;
             }
         } while (!head_atomic_.compare_exchange_weak(head, head_next, std::memory_order_release));
-        data[head].item = std::forward<T>(item);
+        data[head].item = std::forward<U>(item);
         data[head].seq.store(head, std::memory_order_release);
         return true;
     }

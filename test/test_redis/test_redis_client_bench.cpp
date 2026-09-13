@@ -23,7 +23,8 @@ std::string random_string(size_t len = 8) {
 
 void pipeline_stress_test() {
     SimpleRedisClient client;
-    if (!client.connect("127.0.0.1", 6379)) {
+    if (!client.connect("10.0.65.69", 31005)) {
+    // if (!client.connect("127.0.0.1", 6379)) {
         std::cerr << "Failed to connect to Redis.\n";
         return;
     }
@@ -67,10 +68,15 @@ void pipeline_stress_test() {
 
     // 2. 统一等待所有响应
     for (auto& p : promises) {
-        auto resp = p->get_future().get();
-        if (resp.type == RESPType::SimpleString && resp.as_string() == "OK") {
-            success++;
-        } else {
+        try {
+            auto resp = p->get_future().get();
+            if (resp.type == RESPType::SimpleString && resp.as_string() == "OK") {
+                success++;
+            } else {
+                failures++;
+            }
+        } catch (std::exception& e) {
+            std::cout << "Error: " << e.what() << "\n";
             failures++;
         }
     }

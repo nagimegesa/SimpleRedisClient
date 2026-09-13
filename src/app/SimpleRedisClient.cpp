@@ -14,14 +14,19 @@
 
 struct RedisConnection {
     std::shared_ptr<ISocket> socket;
-
     std::queue<std::shared_ptr<std::promise<RESPValue>>> promises;
 
     // SpinLock lock; // 自旋锁比 mutex 好一点，但是不多
     // std::mutex lock;
 
+    std::atomic<bool> highLevel = {false };
+
     RedisConnection() = default;
-    RedisConnection(RedisConnection&&)  noexcept {}
+    RedisConnection(RedisConnection&& r) noexcept {
+        socket = std::move(r.socket);
+        promises = std::move(r.promises);
+        highLevel = r.highLevel.load();
+    };
 };
 
 struct SimpleRedisClient::ClientImpl {
@@ -54,6 +59,15 @@ struct SimpleRedisClient::ClientImpl {
         for (auto& client : clients) {
             client.socket->asyncRead([this, &client](const std::string& buf, std::size_t sz) {
                 return this->read(client, buf, sz);
+            });
+
+            client.socket->registerHighLevelCallback([&client](const std::shared_ptr<ISocket>& socket) {
+                LOG(WARNING) << "SimpleRedisClient: HighLevelCallback is call, stop for write";
+                client.highLevel = true;
+            });
+
+            client.socket->registerLowLevelCallback([&client](const std::shared_ptr<ISocket>& socket) {
+                client.highLevel = false;
             });
         }
         epollContext->run();
@@ -88,14 +102,20 @@ struct SimpleRedisClient::ClientImpl {
         //     clients[which_sock].promises.push(p);
         // }
 
+        if (clients[which_sock].highLevel) {
+            p->set_exception(std::make_exception_ptr(std::runtime_error("to many bytes to write")));
+            return p;
+        }
+
         clients[which_sock].socket->asyncWriteOnce(
             [p, this, which_sock](bool success) {
                 if (!success) {
                     LOG(ERR) << "SimpleRedisClient::execute() failed";
                     p->set_exception(std::make_exception_ptr(std::runtime_error("write error")));
+                } else { // 写失败不入队
+                    // 这里 一个socket会对应唯一的一个 epoll context, context 是单线程的，保证先写入的先调用回调
+                    clients[which_sock].promises.push(p);
                 }
-                // 这里 一个socket会对应唯一的一个 epoll context, context 是单线程的，保证先写入的先调用回调
-                clients[which_sock].promises.push(p);
             },
             std::make_shared<std::string>(std::move(cmd)));
 

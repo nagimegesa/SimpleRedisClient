@@ -13,6 +13,8 @@ class ISocket;
 
 using AcceptContextCallback = std::function<void(std::shared_ptr<ISocket> client)>;
 using ReadContextCallBack = std::function<std::size_t(const std::string&, int size)>;
+using HighLevelCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
+using LowLevelCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
 using WriteContextCallBack = std::function<void(bool)>;
 
 class ISocket : public std::enable_shared_from_this<ISocket> {
@@ -36,7 +38,14 @@ public:
         const std::shared_ptr<std::string>& buf
     ) = 0;
 
+    virtual void registerHighLevelCallback(const HighLevelCallback& callback) = 0;
+    virtual void registerLowLevelCallback(const LowLevelCallback& callback) = 0;
+
     static constexpr int DEFAULT_BACKLOG = -1;
+    static constexpr int DEFAULT_SEND_BUFFER_SIZE = 1024 * 8;
+    static constexpr int DEFAULT_RECV_BUFFER_SIZE = 1024 * 8;
+    static constexpr int DEFAULT_HIGH_LEVEL_SIZE = 1024 * 512;
+    static constexpr int DEFAULT_LOW_LEVEL_SIZE = 1024 * 8;
 };
 
 #endif
