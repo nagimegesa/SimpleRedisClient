@@ -78,8 +78,12 @@ if (CMAKE_SYSTEM_NAME MATCHES "Windows")
     target_link_libraries(socket ws_sc2)
 endif()
 
+add_library(rpc src/app/rpc/RpcServer.cpp)
+target_link_libraries(rpc net utils)
+
 add_executable(main src/main.cpp)
 add_executable(redis_cli src/redis_cli.cpp)
+add_executable(rpcApp src/rpc.cpp src/protoc/hello.pb.cc)
 
 add_executable(test_thread_pool test/test_thread_pool/test_thread_pool_benchmark.cpp)
 add_executable(test_thread_pool_result test/test_thread_pool/test_thread_pool_result.cpp)
@@ -92,6 +96,7 @@ add_executable(test_echo_server test/test_net/test_echo_server.cpp)
 
 target_link_libraries(main thread utils net)
 target_link_libraries(redis_cli redis)
+target_link_libraries(rpcApp rpc pthread protobuf)
 
 target_link_libraries(test_thread_pool thread)
 target_link_libraries(test_thread_pool_result thread)

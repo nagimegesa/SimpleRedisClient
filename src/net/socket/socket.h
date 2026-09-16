@@ -18,6 +18,18 @@ using LowLevelCallback = std::function<void(const std::shared_ptr<ISocket>& clie
 using WriteContextCallBack = std::function<void(bool)>;
 
 class ISocket : public std::enable_shared_from_this<ISocket> {
+
+#ifdef __linux__
+public:
+using SocketHandler = int;
+    constexpr static SocketHandler ERROR_SOCKET = - 1;
+#elif _WIN32
+public:
+using SockHandle = SOCKET;
+    constexpr static SocketHandler ERROR_SOCKET = INVALID_SOCKET;
+#else
+#endif
+
 protected:
     std::weak_ptr<EpollContext> epollContext_;
 public:
@@ -37,6 +49,8 @@ public:
         const WriteContextCallBack&         callback,
         const std::shared_ptr<std::string>& buf
     ) = 0;
+
+    virtual SocketHandler getNative() const = 0;
 
     virtual void registerHighLevelCallback(const HighLevelCallback& callback) = 0;
     virtual void registerLowLevelCallback(const LowLevelCallback& callback) = 0;

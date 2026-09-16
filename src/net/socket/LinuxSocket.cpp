@@ -10,7 +10,6 @@
 #include <arpa/inet.h>
 #include <memory>
 #include <string>
-#include <tbb/internal/_template_helpers.h>
 
 #include "context/EpollContext.h"
 
@@ -176,29 +175,40 @@ void LinuxSocket::registerHighLevelCallback(const HighLevelCallback& callback) {
 }
 
 void LinuxSocket::setNoBlock() {
+
     int flags = ::fcntl(socket_fd, F_GETFL, 0);
     if (flags == -1) {
         LOG(ERR) << "fcntl F_GETFL failed";
         return;
     }
+
+    // 非阻塞 socket
     if (::fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         LOG(ERR) << "fcntl F_SETFL failed";
     }
 
+    // 关闭 Nagle
     int enable = 1;
     if (setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable)) < 0) {
         LOG(ERR) <<"setsockopt TCP_NODELAY failed";
     }
 
+    // 扩大写缓冲区
     if (setsockopt( socket_fd, SOL_SOCKET, SO_SNDBUF, &ISocket::DEFAULT_SEND_BUFFER_SIZE, sizeof( ISocket::DEFAULT_SEND_BUFFER_SIZE ) )) {
         LOG(ERR) << "setsockopt SO_SNDBUF failed";
     }
 
+    // 扩大读缓冲区
     if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVBUF, &ISocket::DEFAULT_RECV_BUFFER_SIZE, sizeof( ISocket::DEFAULT_RECV_BUFFER_SIZE ) )) {
         LOG(ERR) << "setsockopt SO_RCVBUF failed";
     }
+
+    // 快速关闭
+    if (setsockopt(socket_fd,SOL_SOCKET, SO_REUSEADDR, &enable,sizeof(enable)) < 0) {
+        LOG(ERR) << "setsockopt SO_REUSEADDR failed";
+    }
 }
 
-int LinuxSocket::getNative() const {
+ISocket::SocketHandler LinuxSocket::getNative() const {
     return socket_fd;
 }

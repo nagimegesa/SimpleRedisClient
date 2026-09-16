@@ -25,6 +25,7 @@ struct Result {
 
         return any_cast<T>(result);
     }
+    Result(std::nullptr_t) {}
     Result(std::any result) : result(std::move(result)) {}
     Result(std::any result, std::exception_ptr exception) : result(std::move(result)), exception(std::move(exception)) {}
 };
@@ -63,7 +64,8 @@ public:
                     cb = std::forward<Callback>(cb)]() mutable -> void {
             if constexpr(is_void_func_t<F, Args...>::value) {
                 try {
-                    func(args...);
+                    // func(args...);
+                    std::invoke(func, std::forward<Args>(args)...);
                     if constexpr (!std::is_same_v<Callback, CallBackNone>) {
                         if (use_async_cb) {
                             enqueue_callback([cb = std::move(cb)]() { cb(nullptr); });
@@ -83,7 +85,7 @@ public:
                 }
             } else {
                 try {
-                    auto t = func(args...);
+                    auto t = std::invoke(func, std::forward<Args>(args)...);
                     if constexpr (!std::is_same_v<Callback, CallBackNone>) {
                         if (use_async_cb) {
                             enqueue_callback([cb = std::move(cb), t = std::move(t)]() { cb(Result(t)); });
