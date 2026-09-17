@@ -24,7 +24,10 @@ LinuxSocket::LinuxSocket(int fd, const std::shared_ptr<EpollContext>& epoll_cont
 }
 
 LinuxSocket::~LinuxSocket() {
-    LinuxSocket::close();
+    if (socket_fd != -1) {
+        ::close(socket_fd);
+        socket_fd = -1;
+    }
 }
 
 bool LinuxSocket::bind(const std::string& ip, unsigned short port) {
@@ -124,12 +127,8 @@ bool LinuxSocket::connect(const char* ip, unsigned short port) {
 }
 
 void LinuxSocket::close() {
-    if (socket_fd != -1) {
-        if (auto context = epollContext_.lock()) {
-            context->removeSocket(shared_from_this());
-        }
-        ::close(socket_fd);
-        socket_fd = -1;
+    if (auto context = epollContext_.lock()) {
+        context->removeSocket(shared_from_this());
     }
 }
 

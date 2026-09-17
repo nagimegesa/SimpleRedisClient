@@ -15,6 +15,7 @@ using AcceptContextCallback = std::function<void(std::shared_ptr<ISocket> client
 using ReadContextCallBack = std::function<std::size_t(const std::string&, int size)>;
 using HighLevelCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
 using LowLevelCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
+using ClosingCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
 using WriteContextCallBack = std::function<void(bool)>;
 
 class ISocket : public std::enable_shared_from_this<ISocket> {
@@ -54,6 +55,16 @@ public:
 
     virtual void registerHighLevelCallback(const HighLevelCallback& callback) = 0;
     virtual void registerLowLevelCallback(const LowLevelCallback& callback) = 0;
+
+    // !! 注意这里 EpollContext 只适配了 linux
+    std::shared_ptr<EpollContext> getContext() const {
+        if (!epollContext_.expired()) {
+            return epollContext_.lock();
+        }
+
+        throw std::runtime_error("context 的周期一定比 socket 长，如果使用正确，不会执行到这里");
+    }
+
 
     static constexpr int DEFAULT_BACKLOG = -1;
     static constexpr int DEFAULT_SEND_BUFFER_SIZE = 1024 * 8;

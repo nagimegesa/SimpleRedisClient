@@ -44,6 +44,7 @@ struct Connection {
     int in_queue_write_buffer_byte_size = 0;
     HighLevelCallback high_level_callback;
     LowLevelCallback low_level_callback;
+    ClosingCallback closing_callback;
     bool high_level_callback_set = false;
     bool read_registered = false;             // 是否已注册 EPOLLIN
     bool write_registered = false;            // 是否已注册 EPOLLOUT
@@ -407,7 +408,11 @@ private:
         if (it == connections_.end()) return;
         auto conn = it->second; // 拷贝 shared_ptr 以便在 map 外使用
 
-        // 从 epoll 中删除（可能之前已被移除，忽略错误）
+        if (conn->closing_callback) {
+            conn->closing_callback(conn->socket);
+        }
+
+        // 从 epoll 中删除
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         // 从 map 中移除
         connections_.erase(it);
@@ -539,6 +544,16 @@ public:
 
         auto& conn = it->second;
         conn->low_level_callback = callback;
+    }
+
+    void doRegisterCloseCallback(int fd, const ClosingCallback& callback) {
+        auto it = connections_.find(fd);
+        if (it == connections_.end()) {
+            LOG(WARNING) << "EventLoopThread: try register a callback for unknown socket " << fd;
+            return;
+        }
+        auto& conn = it->second;
+        conn->closing_callback = callback;
     }
 
     void doClose(int fd) {
@@ -688,6 +703,15 @@ public:
             size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask([this, index, fd, callback] {
                loops_[index]->doRegisterLowLevelCallback(fd, callback);
+            });
+        }
+    }
+
+    void registerCloseCallback(const std::shared_ptr<ISocket>& socket, const ClosingCallback& callback) {
+        if (int fd = -1; checkSocket(socket, fd)) {
+            size_t index = std::hash<int>{}(fd) % loops_.size();
+            loops_[index]->postTask([this, index, fd, callback] {
+                loops_[index]->doRegisterCloseCallback(fd, callback);
             });
         }
     }
