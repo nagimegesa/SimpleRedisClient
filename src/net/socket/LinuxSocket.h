@@ -32,6 +32,7 @@ public:
 
     void registerLowLevelCallback(const LowLevelCallback& callback) override;
     void registerHighLevelCallback(const HighLevelCallback& callback) override;
+    void registerCloseCallback(const ClosingCallback& callback) override;
 
     void setNoBlock() override;
     int getNative() const;

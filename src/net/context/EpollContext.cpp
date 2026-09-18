@@ -404,6 +404,15 @@ private:
 
     void closeConnection(int fd) {
         LOG(DEBUG) << "EventLoopThread: closing connection " << fd;
+
+        // 从 epoll 中删除
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+
+        if (accept_socket_set_.contains(fd)) {
+            accept_socket_set_.erase(fd);
+            return;
+        }
+
         auto it = connections_.find(fd);
         if (it == connections_.end()) return;
         auto conn = it->second; // 拷贝 shared_ptr 以便在 map 外使用
@@ -412,8 +421,6 @@ private:
             conn->closing_callback(conn->socket);
         }
 
-        // 从 epoll 中删除
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         // 从 map 中移除
         connections_.erase(it);
 
@@ -715,6 +722,13 @@ public:
             });
         }
     }
+
+    void postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) {
+        if (int fd = -1; checkSocket(socket, fd)) {
+            size_t index = std::hash<int>{}(fd) % loops_.size();
+            loops_[index]->postTask(function);
+        }
+    }
 };
 
 EpollContext::EpollContext() : impl(std::make_unique<EpollContextImpl>()) {}
@@ -750,6 +764,17 @@ void EpollContext::registerLowLevelCallback(
     const LowLevelCallback& callback
 ) const {
     impl->registerLowLevel(socket, callback);
+}
+
+void EpollContext::registerCloseCallback(
+    const std::shared_ptr<ISocket>& socket,
+    const ClosingCallback& callback
+) const {
+    impl->registerCloseCallback(socket, callback);
+}
+
+void EpollContext::postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const {
+    impl->postTask(socket, function);
 }
 
 void EpollContext::run(bool block) const {

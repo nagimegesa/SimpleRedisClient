@@ -55,6 +55,7 @@ public:
 
     virtual void registerHighLevelCallback(const HighLevelCallback& callback) = 0;
     virtual void registerLowLevelCallback(const LowLevelCallback& callback) = 0;
+    virtual void registerCloseCallback(const ClosingCallback& callback) = 0;
 
     // !! 注意这里 EpollContext 只适配了 linux
     std::shared_ptr<EpollContext> getContext() const {

@@ -68,7 +68,7 @@ struct RpcService : RpcServiceBase {
     template <typename Ret, typename Arg> requires std::is_base_of_v<::google::protobuf::Message, Ret>
     && std::is_base_of_v<::google::protobuf::Message, Arg>
     void registerFunction(RpcServer& server, const std::string& name, Ret(Derived::*func)(Arg arg)) {
-        server.addHandler(name, [func, this](std::string buffer) -> std::string {
+        server.addHandler(name, [func, this](const std::string& buffer) -> std::string {
             Arg req;
             if (!req.ParseFromString(buffer)) {
                 throw BadParamException("bad parameters");
@@ -81,6 +81,38 @@ struct RpcService : RpcServiceBase {
             return out;
         });
     }
+
+    template<typename Ret> requires std::is_base_of_v<::google::protobuf::Message, Ret>
+    void registerFunction(RpcServer& server, const std::string& name, Ret(Derived::*func)()) {
+        server.addHandler(name, [func, this](const std::string&) -> std::string {
+            Ret ret = (static_cast<Derived*>(this)->*func)();
+            std::string out;
+            if (!ret.SerializeToString(&out)) {
+                throw BadResponseException("bad response");
+            }
+            return out;
+        });
+    }
+
+    template <typename Arg> requires std::is_base_of_v<::google::protobuf::Message, Arg>
+    void registerFunction(RpcServer& server, const std::string& name, void(Derived::*func)(Arg arg)) {
+        server.addHandler(name, [func, this](const std::string& buffer) -> std::string {
+            Arg req;
+            if (!req.ParseFromString(buffer)) {
+                throw BadParamException("bad parameters");
+            }
+            (static_cast<Derived*>(this)->*func)(std::move(req));
+            return "";
+        });
+    }
+
+    void registerFunction(RpcServer& server, const std::string& name, void(Derived::*func)()) {
+        server.addHandler(name, [func, this](const std::string& buffer) -> std::string {
+            (static_cast<Derived*>(this)->*func)();
+            return "";
+        });
+    }
+
 
     static std::unique_ptr<Derived> create() {
         return std::make_unique<Derived>();

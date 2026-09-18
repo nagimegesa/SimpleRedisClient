@@ -11,7 +11,7 @@
 
 int main() {
 
-    Logger::getInstance().set_log_level(WARNING);
+    Logger::getInstance().set_log_level(DEBUG);
 
     auto context = std::make_shared<EpollContext>();
     auto socket = SocketManager::getInstance().getSocket(context);

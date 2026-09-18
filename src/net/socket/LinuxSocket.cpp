@@ -173,6 +173,14 @@ void LinuxSocket::registerHighLevelCallback(const HighLevelCallback& callback) {
     }
 }
 
+void LinuxSocket::registerCloseCallback(const ClosingCallback& callback) {
+    if (auto context = epollContext_.lock()) {
+        context->registerCloseCallback(shared_from_this(), callback);
+    } else {
+        LOG(ERR) << "LinuxSocket::registerCloseCallback: epollContext is nullptr";
+    }
+}
+
 void LinuxSocket::setNoBlock() {
 
     int flags = ::fcntl(socket_fd, F_GETFL, 0);

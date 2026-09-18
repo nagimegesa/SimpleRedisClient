@@ -1,4 +1,5 @@
 syntax = "proto3";
+option java_multiple_files = true;   // 每个 message 独立一个类，不再嵌套
 
 message HelloWorldRequest {
   string msg = 1;
@@ -6,8 +7,4 @@ message HelloWorldRequest {
 
 message HelloWorldResponse {
   string res = 1;
-}
-
-service HelloWorldService {
-  rpc Hello(HelloWorldRequest) returns (HelloWorldResponse);
 }

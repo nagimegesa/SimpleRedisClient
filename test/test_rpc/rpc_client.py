@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.join(HERE, "protoc"))
 import hello_pb2  # noqa: E402
 
 HOST = "127.0.0.1"
-PORT = 8881
+PORT = 8891
 
 START = b"\x0a\x0b"
 END = b"\x0b\x0c"

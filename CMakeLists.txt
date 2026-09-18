@@ -63,6 +63,7 @@ target_link_libraries(
         net
         utils
         thread
+        ${TCMALLOC_LIB}
 )
 
 target_include_directories(
@@ -71,7 +72,7 @@ target_include_directories(
 )
 
 add_library(redis src/app/SimpleRedisClient.cpp)
-target_link_libraries(redis net ${TCMALLOC_LIB}) # 这里连接 tcmalloc
+target_link_libraries(redis net) # 这里连接 tcmalloc
 target_include_directories(redis PUBLIC src/app)
 
 if (CMAKE_SYSTEM_NAME MATCHES "Windows")

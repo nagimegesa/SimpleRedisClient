@@ -24,14 +24,12 @@ struct Hello : RpcService<Hello> {
 };
 
 int main() {
-    Logger::getInstance().set_log_level(DEBUG);
+    Logger::getInstance().set_log_level(WARNING);
     RpcServer server;
-    if (!server.bindAndListen("127.0.0.1", 8881)) {
+    if (!server.bindAndListen("127.0.0.1", 8891)) {
         std::cout << "bind failed" << std::endl;
     }
-
-    std::cout << "bind at 127.0.0.1:8881" << std::endl;
-
+    std::cout << "bind at 127.0.0.1:8891" << std::endl;
     server.registerService(Hello::create());
 
     server.run(true); // 阻塞运行

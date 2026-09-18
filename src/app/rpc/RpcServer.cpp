@@ -13,14 +13,14 @@
 using RpcHandler = std::function<std::string(std::string)>;
 
 /*
- * 0x0a 0x0b    // 1
- * type 1 字节  1 = REQUEST 2 = RESPONSE 3 = ERROR server端只会接收到 1 // 2
- * request_id   8 字节 大端 无符号，不能为 0 // 10
- * name_len 1 字节 // 11
- * function name for name_len // 11 + name_len
- * parma_len  4 字节 大端  // 15 + name_len
- * serialize parma for parma_len // 15 + name_len + parma_len
- * 0x0b 0x0c // 17 + name_len + parma_len
+ * 0x0a 0x0b    // 2
+ * type 1 字节  1 = REQUEST 2 = RESPONSE 3 = ERROR server端只会接收到 1 // 3
+ * request_id   8 字节 大端 无符号，不能为 0 // 11
+ * name_len 1 字节 // 12
+ * function name for name_len // 12 + name_len
+ * parma_len  4 字节 大端  // 16 + name_len
+ * serialize parma for parma_len // 16 + name_len + parma_len
+ * 0x0b 0x0c // 18 + name_len + parma_len
  */
 
 enum ParserStatus {
@@ -63,7 +63,7 @@ struct RpcContext {
     std::string parms;
     std::vector<char> buffer;
 
-    RpcContext() : status(SOA), result(WAITING), name(), parms(), buffer(), request_id(0) {}
+    RpcContext() : status(SOA), result(WAITING), request_id(0), name(), parms(), buffer() {}
 };
 
 namespace {
@@ -413,9 +413,6 @@ private:
     std::set<std::unique_ptr<RpcServiceBase>> services_; // 保留Service防止被析构
     std::unordered_map<std::string, RpcHandler> handlers_;
 
-    std::unordered_map<ISocket::SocketHandler, RpcContext> clients_;
-    std::mutex clientsMutex_;  // TODO: 这个锁可以优化，后面再说
-
     std::shared_ptr<ISocket> socket_;
 
     ThreadPool threadPool_;
@@ -424,67 +421,49 @@ public:
     RpcServerImpl(): context_(std::make_shared<EpollContext>()), threadPool_(2) {
         socket_ = SocketManager::getInstance().getSocket(context_);
         socket_->asyncAccept([this](const std::shared_ptr<ISocket>& client) {
-            this->acceptClient(client);
+            client->getContext()->postTask(client, [this, client]() {
+                acceptClient(client);
+            });
         });
     }
 
     void acceptClient(const std::shared_ptr<ISocket>& client) {
+        LOG(DEBUG) << "RpcServer:: accept a new client";
 
-        {
-            std::lock_guard<std::mutex> lock(clientsMutex_);
-            clients_[client->getNative()] = RpcContext{};
-        }
-
-        client->asyncRead([this, client](const std::string & buffer, std::size_t size) {
-
+        auto context = std::make_shared<RpcContext>(); // 这个 context 会保存到 close
+        client->asyncRead([this, client, context](const std::string& buffer, std::size_t size) {
+            LOG(DEBUG) << "RpcServer: read " << " size " << size << " fd " << client->getNative();
             if (size == 0) {
-                clients_.erase(client->getNative());
                 client->close();
                 return size;
             }
 
-            RpcContext context;
-            {
-                std::lock_guard<std::mutex> lock(clientsMutex_);
-                if (clients_.find(client->getNative()) == clients_.end()) {
-                    LOG(ERR) << "RpcServer::acceptClient: client not found";
-                    return size;
-                }
-                // 拿到直接删除，防止出现奇怪的问题，对于每一个socket, read一定是顺序的
-                context = std::move(clients_[client->getNative()]);
-                clients_.erase(client->getNative());
-            }
-
-            std::size_t parsed = 0;
-            parse(buffer, 0, size, parsed, context);
-
-            if (context.result == COMPLETE || context.result == ERROR) {
-
-                {
-                    // 解析完或者出错放一个新的
-                    std::lock_guard<std::mutex> lock(clientsMutex_);
-                    clients_[client->getNative()] = RpcContext{};
+            std::size_t offset = 0;
+            while (offset < size) {
+                std::size_t parsed = 0;
+                parse(buffer, offset, size, parsed, *context);
+                offset += parsed;
+                if (context->result == COMPLETE || context->result == ERROR) {
+                    RpcContext local = std::move(*context);
+                    *context = RpcContext{};
+                    // 扔给线程池避免阻塞 epoll 线程
+                    threadPool_.put([](const Result&) {},
+                        &RpcServerImpl::dispatch, this, std::move(local), client);
+                    continue;
                 }
 
-                // 扔给线程池避免阻塞 epoll 线程
-                threadPool_.put([](const Result&) {},
-                    &RpcServerImpl::dispatch, this, std::move(context), client);
-
-                return parsed;
-            }
-
-            if (context.result == WAITING) {
-                {
-                    // 没有解析完，放回去
-                    std::lock_guard<std::mutex> lock(clientsMutex_);
-                    clients_[client->getNative()] = std::move(context);
+                if (context->result == WAITING) {
+                    return offset;
                 }
-                return parsed;
-            }
 
-            // 不可能执行到这里
-            assert(false);
-            return size;
+                // 不可能执行到这里
+                assert(false);
+            }
+            return offset;
+        });
+
+        client->registerCloseCallback([](const std::shared_ptr<ISocket>& client) {
+            LOG(DEBUG) << "RpcServer: close " << client->getNative();
         });
     }
 
@@ -497,6 +476,7 @@ public:
             response = buildErrorResponse(context.request_id, ERR_BAD_REQUEST);
         } else if (context.result == COMPLETE) {
             if (handlers_.contains(context.name)) {
+                LOG(DEBUG) << "Rpc server: dispatch function " << context.name;
                 try {
                     std::string res = handlers_[context.name](std::move(context.parms));
                     response = buildResponse(std::move(res), context.request_id);

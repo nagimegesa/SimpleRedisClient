@@ -32,6 +32,8 @@ public:
     void removeSocket(const std::shared_ptr<ISocket>& socket) const;
     void registerHighLevelCallback(const std::shared_ptr<ISocket>& socket, const HighLevelCallback& callback) const;
     void registerLowLevelCallback(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) const;
+    void registerCloseCallback(const std::shared_ptr<ISocket>& socket, const ClosingCallback& callback) const;
+    void postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const;
     void run(bool block=false) const;
     void close() const;
 
