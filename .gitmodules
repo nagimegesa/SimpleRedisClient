@@ -1,0 +1,3 @@
+[submodule "3rdparty/nacos-sdk-cpp"]
+	path = 3rdparty/nacos-sdk-cpp
+	url = https://github.com/nacos-group/nacos-sdk-cpp.git

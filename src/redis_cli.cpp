@@ -6,7 +6,7 @@
 #include <string>
 #include <sstream>
 #include <vector>
-#include "app/SimpleRedisClient.h"
+#include "app/redis/SimpleRedisClient.h"
 #include "logger/Logger.h"
 
 std::vector<std::string> splitArgs(const std::string& line) {

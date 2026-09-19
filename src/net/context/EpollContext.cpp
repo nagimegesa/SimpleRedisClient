@@ -18,7 +18,7 @@
 #include <sys/uio.h>
 
 #include "logger/Logger.h"
-#include "queue/LockFreeQueue.h"
+#include "thread_pool/queue/LockFreeQueue.h"
 #include "socket/LinuxSocket.h"
 
 // 写元信息

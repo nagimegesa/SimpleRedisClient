@@ -13,7 +13,7 @@
 /*
  * struct HelloRpc : public RpcService<HelloRpc> {
  *     virtual void setup(RpcServer& server) override {
- *         registerFunction(server, "hello", &HelloRpc::hello);
+ *         registerFunction(server, "HelloService", "hello", &HelloRpc::hello);
  *     }
  *
  *     HelloWorldResponse hello(HelloWorldRequest request) {
@@ -36,7 +36,7 @@ class RpcServer {
 private:
     struct RpcServerImpl;
     std::unique_ptr<RpcServerImpl> impl;
-    void addHandler(const std::string&name, std::function<std::string(std::string buffer)> func);
+    void addHandler(const std::string& group, const std::string& name, std::function<std::string(std::string buffer)> func);
     template <typename Derived> friend struct RpcService;
 
 public:
@@ -67,50 +67,58 @@ template<typename Derived>
 struct RpcService : RpcServiceBase {
     template <typename Ret, typename Arg> requires std::is_base_of_v<::google::protobuf::Message, Ret>
     && std::is_base_of_v<::google::protobuf::Message, Arg>
-    void registerFunction(RpcServer& server, const std::string& name, Ret(Derived::*func)(Arg arg)) {
-        server.addHandler(name, [func, this](const std::string& buffer) -> std::string {
-            Arg req;
-            if (!req.ParseFromString(buffer)) {
-                throw BadParamException("bad parameters");
-            }
-            Ret ret = (static_cast<Derived*>(this)->*func)(std::move(req));
-            std::string out;
-            if (!ret.SerializeToString(&out)) {
-                throw BadResponseException("bad response");
-            }
-            return out;
-        });
+    void registerFunction(RpcServer& server, const std::string& group, const std::string& name, Ret(Derived::*func)(Arg arg)) {
+        server.addHandler(group, name,
+                          [func, this](const std::string& buffer) -> std::string {
+                              Arg req;
+                              if (!req.ParseFromString(buffer)) {
+                                  throw BadParamException("bad parameters");
+                              }
+                              Ret         ret = (static_cast<Derived*>(this)->*func)(std::move(req));
+                              std::string out;
+                              if (!ret.SerializeToString(&out)) {
+                                  throw BadResponseException("bad response");
+                              }
+                              return out;
+                          }
+        );
     }
 
     template<typename Ret> requires std::is_base_of_v<::google::protobuf::Message, Ret>
-    void registerFunction(RpcServer& server, const std::string& name, Ret(Derived::*func)()) {
-        server.addHandler(name, [func, this](const std::string&) -> std::string {
-            Ret ret = (static_cast<Derived*>(this)->*func)();
-            std::string out;
-            if (!ret.SerializeToString(&out)) {
-                throw BadResponseException("bad response");
-            }
-            return out;
-        });
+    void registerFunction(RpcServer& server, const std::string& group, const std::string& name, Ret(Derived::*func)()) {
+        server.addHandler(group, name,
+                          [func, this](const std::string&) -> std::string {
+                              Ret         ret = (static_cast<Derived*>(this)->*func)();
+                              std::string out;
+                              if (!ret.SerializeToString(&out)) {
+                                  throw BadResponseException("bad response");
+                              }
+                              return out;
+                          }
+        );
     }
 
     template <typename Arg> requires std::is_base_of_v<::google::protobuf::Message, Arg>
-    void registerFunction(RpcServer& server, const std::string& name, void(Derived::*func)(Arg arg)) {
-        server.addHandler(name, [func, this](const std::string& buffer) -> std::string {
-            Arg req;
-            if (!req.ParseFromString(buffer)) {
-                throw BadParamException("bad parameters");
-            }
-            (static_cast<Derived*>(this)->*func)(std::move(req));
-            return "";
-        });
+    void registerFunction(RpcServer& server, const std::string& group, const std::string& name, void(Derived::*func)(Arg arg)) {
+        server.addHandler(group, name,
+                          [func, this](const std::string& buffer) -> std::string {
+                              Arg req;
+                              if (!req.ParseFromString(buffer)) {
+                                  throw BadParamException("bad parameters");
+                              }
+                              (static_cast<Derived*>(this)->*func)(std::move(req));
+                              return "";
+                          }
+        );
     }
 
-    void registerFunction(RpcServer& server, const std::string& name, void(Derived::*func)()) {
-        server.addHandler(name, [func, this](const std::string& buffer) -> std::string {
-            (static_cast<Derived*>(this)->*func)();
-            return "";
-        });
+    void registerFunction(RpcServer& server, const std::string& group, const std::string& name, void(Derived::*func)()) {
+        server.addHandler(group, name,
+                          [func, this](const std::string& buffer) -> std::string {
+                              (static_cast<Derived*>(this)->*func)();
+                              return "";
+                          }
+        );
     }
 
 

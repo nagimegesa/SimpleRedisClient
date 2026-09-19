@@ -9,7 +9,7 @@
 #include "logger/Logger.h"
 #include "socket/SocketManager.h"
 #include "context/EpollContext.h"
-#include "redis.h"
+#include "../../src/app/redis/redis.h"
 
 int main(int argc, char* argv[]) {
     int N = (argc > 1) ? std::stoi(argv[1]) : 1000000;

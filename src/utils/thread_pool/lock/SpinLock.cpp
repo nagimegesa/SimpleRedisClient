@@ -2,7 +2,7 @@
 // Created by computer on 2026/8/19.
 //
 
-#include "lock/SpinLock.h"
+#include "thread_pool/lock/SpinLock.h"
 #include <atomic>
 #include <thread>
 #include <immintrin.h> // for _mm_pause

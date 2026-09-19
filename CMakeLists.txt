@@ -8,104 +8,22 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_library(TCMALLOC_LIB tcmalloc REQUIRED PATHS /usr/bin/lib)
-find_library(PROFILER_LIB profiler REQUIRED PATHS /usr/bin/lib)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -gdwarf-4 -fno-omit-frame-pointer")
-option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
-if(ENABLE_ASAN)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g -O1)
-        add_link_options(-fsanitize=address)
-        message(STATUS "AddressSanitizer enabled")
-    else()
-        message(WARNING "AddressSanitizer not supported by compiler ${CMAKE_CXX_COMPILER_ID}")
-    endif()
-endif()
-
-if(ENABLE_TSAN)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g -O1)
-        add_link_options(-fsanitize=thread)
-        message(STATUS "ThreadSanitizer enabled")
-    else()
-        message(WARNING "ThreadSanitizer not supported by compiler ${CMAKE_CXX_COMPILER_ID}")
-    endif()
-endif()
-
-add_library(utils src/utils/logger/Logger.cpp)
-target_include_directories(utils PUBLIC src/utils)
-
-add_library(thread
-        src/utils/thread_pool/thread_pool.cpp
-        src/utils/thread_pool/lock/SpinLock.cpp
-)
-
-target_link_libraries(
-        thread
-        utils
-)
-
-if (CMAKE_SYSTEM_NAME MATCHES "Linux")
-    target_link_libraries(thread pthread)
-endif()
-
-target_include_directories(thread PUBLIC src/utils/thread_pool/)
-
-add_library(
-        net
-        src/net/socket/SocketManager.cpp
-        src/net/socket/WindowsSocket.cpp
-        src/net/socket/LinuxSocket.cpp
-        src/net/context/EpollContext.cpp
-)
-
-target_link_libraries(
-        net
-        utils
-        thread
-        ${TCMALLOC_LIB}
-)
-
-target_include_directories(
-        net PUBLIC
-        src/net/
-)
-
-add_library(redis src/app/SimpleRedisClient.cpp)
-target_link_libraries(redis net) # 这里连接 tcmalloc
-target_include_directories(redis PUBLIC src/app)
-
-if (CMAKE_SYSTEM_NAME MATCHES "Windows")
-    target_link_libraries(socket ws_sc2)
-endif()
-
-add_library(rpc src/app/rpc/RpcServer.cpp)
-target_link_libraries(rpc net utils)
-
-add_executable(main src/main.cpp)
-add_executable(redis_cli src/redis_cli.cpp)
-add_executable(rpcApp src/rpc.cpp src/protoc/hello.pb.cc)
+add_subdirectory(src)
 
 add_executable(test_thread_pool test/test_thread_pool/test_thread_pool_benchmark.cpp)
 add_executable(test_thread_pool_result test/test_thread_pool/test_thread_pool_result.cpp)
 add_executable(test_redis_acc test/test_redis/test_redis_parser.cpp)
 add_executable(test_redis_bench test/test_redis/test_redis_bench.cpp)
 add_executable(test_redis_client_acc test/test_redis/test_redis_client_bench.cpp)
-
 add_executable(test_spsc_queue test/test_queue/test_spsc_queue.cpp)
 add_executable(test_echo_server test/test_net/test_echo_server.cpp)
+add_executable(test_nacos test/test_nacos/test_nacos.cpp)
 
-target_link_libraries(main thread utils net)
-target_link_libraries(redis_cli redis)
-target_link_libraries(rpcApp rpc pthread protobuf)
-
-target_link_libraries(test_thread_pool thread)
-target_link_libraries(test_thread_pool_result thread)
-target_link_libraries(test_redis_acc redis)
-#target_link_libraries(test_redis_client_acc redis ${PROFILER_LIB})
-target_link_libraries(test_redis_client_acc redis ${PROFILER_LIB})
-target_link_libraries(test_redis_bench redis)
-target_link_libraries(test_spsc_queue utils thread)
-target_link_libraries(test_echo_server utils thread net)
-target_include_directories(test_thread_pool PUBLIC ${PROJECT_SOURCE_DIR}/src)
-target_include_directories(test_thread_pool_result PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test_thread_pool utils)
+target_link_libraries(test_thread_pool_result utils)
+target_link_libraries(test_redis_acc app_redis)
+target_link_libraries(test_redis_client_acc app_redis)
+target_link_libraries(test_redis_bench app_redis)
+target_link_libraries(test_spsc_queue utils)
+target_link_libraries(test_echo_server utils net)
+target_link_libraries(test_nacos app_rpc)

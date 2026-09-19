@@ -5,7 +5,7 @@
 
 #include "RpcServer.h"
 
-#include "thread_pool.h"
+#include "thread_pool/thread_pool.h"
 #include "context/EpollContext.h"
 #include "logger/Logger.h"
 #include "socket/SocketManager.h"
@@ -412,9 +412,7 @@ private:
     std::shared_ptr<EpollContext> context_;
     std::set<std::unique_ptr<RpcServiceBase>> services_; // 保留Service防止被析构
     std::unordered_map<std::string, RpcHandler> handlers_;
-
     std::shared_ptr<ISocket> socket_;
-
     ThreadPool threadPool_;
 
 public:
@@ -510,21 +508,34 @@ public:
         services_.insert(std::move(service));
     }
 
-    void addHandler(const std::string& name, RpcHandler&& handler) {
+    void addHandler(const std::string& group, const std::string& name, RpcHandler&& handler) {
+        registerDiscovery(group, name);
         handlers_[name] = std::move(handler);
     }
 
     bool bindAndListen(const char* ip, short port) {
         if (socket_->bind(ip, port) &&
             socket_->listen(ISocket::DEFAULT_BACKLOG)) {
+
+            // Properties props;
+            // props[PropertyKeyConst::SERVER_ADDR] = "127.0.0.1:8848";//Server address
+            // props[PropertyKeyConst::AUTH_PASSWORD] = "nacos";
+            // props[PropertyKeyConst::AUTH_USERNAME] = "nacos";
+            // auto *factory = nacos::NacosFactoryFactory::getNacosFactory(props);
+            // NamingService* nameService = factory->CreateNamingService();
+
             return true;
         }
         return false;
     }
+
+    void registerDiscovery(const std::string& group, const std::string& name) {
+
+    }
 };
 
-void RpcServer::addHandler(const std::string& name, std::function<std::string(std::string buffer)> func) {
-    impl->addHandler(name, std::move(func));
+void RpcServer::addHandler(const std::string& group, const std::string& name, std::function<std::string(std::string buffer)> func) {
+    impl->addHandler(group, name, std::move(func));
 }
 
 void RpcServer::registerService(std::unique_ptr<RpcServiceBase> service) {

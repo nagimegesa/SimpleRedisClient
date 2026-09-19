@@ -8,17 +8,17 @@
 
 - **RESP 协议**：提供完整的命令构建函数 `buildRESPCommand` 与响应解析器 `RESP_Parser`，支持 Simple String、Error、Integer、Bulk String、Array、Null 六种类型。当接收到的数据不完整时，解析器会抛出 `IncompleteRESPException`，调用方可据此继续等待后续数据。
 - **异步网络框架**：`EpollContext` 基于 Linux epoll 和 eventfd 实现多事件循环线程，非阻塞读写，自动处理分包与粘包。**仅支持 Linux / WSL2**。
-- **高层客户端**：`SimpleRedisClient` 内置 4 条连接（由 `DEFAULT_CLIENT_COUNT` 指定），采用**线程局部轮询**策略：每个线程维护自己的计数器，依次将请求分发到各连接，无需加锁，适合多线程环境。
+- **高层客户端**：`SimpleRedisClient` 内置 4 条连接，采用**线程局部轮询**策略：每个线程维护自己的计数器，依次将请求分发到各连接，无需加锁，适合多线程环境。
 - **线程池**：包含自旋锁 `SpinLock`、任务队列调度、`Result` 结果回传与异常捕获。
-- **日志系统**：`Logger` 支持 DEBUG、INFO、WARNING、ERROR 四个级别，通过宏 `LOG(level)` 使用。
+- **日志系统**：`Logger` 支持 DEBUG、INFO、WARNING、ERROR 四个级别。
 
 ---
 
 ## 环境要求与快速开始
 
 ### 环境要求
-- **操作系统**：Linux 或 WSL2（`EpollContext` 依赖 epoll，Windows 原生不支持）。
-- **编译器**：GCC 14 或更高版本（CMakeLists.txt 中已指定 `/usr/bin/gcc-14` 和 `/usr/bin/g++-14`）。
+- **操作系统**：Linux 或 WSL2。
+- **编译器**：GCC 14 或更高版本。
 - **构建工具**：CMake 3.10+。
 
 ### 编译
@@ -32,11 +32,7 @@ cmake --build cmake-build-release -j$(nproc)
 
 ### 运行交互式客户端
 ```bash
-# 使用 SimpleRedisClient 版（推荐）
 ./cmake-build-release/redis_cli
-
-# 使用 epoll 异步版
-./cmake-build-release/main
 ```
 
 示例会话：
@@ -153,14 +149,17 @@ int main() {
 ## 目录结构
 ```
 src/
-  app/          SimpleRedisClient、RESP 协议（redis.h）
-  net/          SocketManager、LinuxSocket、EpollContext
-  utils/        Logger、ThreadPool、SpinLock、无锁队列
-  main.cpp      epoll 异步版交互式客户端
-  redis_cli.cpp SimpleRedisClient 版交互式客户端
+  app/          
+      redis/     SimpleRedisClient、RESP 协议
+      rpc/       Rpc Server 还在完善中
+  net/           SocketManager、LinuxSocket、EpollContext
+  utils/         Logger、ThreadPool、SpinLock、无锁队列
+  redis_cli.cpp  SimpleRedisClient 版交互式客户端
+  rpc_server.cpp 实现了一个简单的 rpc server, 目前还在完善中
 test/
   test_net/             网络框架基本测试
   test_queue/           无锁队列性能测试
+  test_rpc/             rpc server 的测试
   test_redis/
       test_redis_bench.cpp         epoll 异步 SET 压力测试，直接使用lowapi
       test_redis_client_bench.cpp  pipeline 压力测试
@@ -176,8 +175,7 @@ test/
 
 | 目标                        | 说明                                                                 |
 |---------------------------|--------------------------------------------------------------------|
-| `main`                    | 交互式 Redis 客户端（epoll 异步版）                                           |
-| `redis_cli`               | 交互式 Redis 客户端（SimpleRedisClient 版）                                 |
+| `redis_cli`               | 交互式 Redis 客户端                                 |
 | `test_redis_bench`        | SET 压力测试，连续 1,000,000 条 SET，和 test_redis_client_acc 区别是不走封装的client |
 | `test_redis_client_acc`   | pipeline 压力测试，连续 1,000,000 条 SET                                   |
 | `test_redis_acc`          | RESP 解析正确性与异步集成测试                                                  |
@@ -185,7 +183,7 @@ test/
 | `test_thread_pool_result` | 线程池 Result 接口冒烟测试                                                  |
 | `test_spsc_queue`         | 无锁队列性能基准测试                                                         |
 | `test_echo_server`        | 简单的EchoServer实现                                                    |
-
+| `其他`                      | 其他还在实现的目标                                                          |
 ---
 
 ## 测试与基准结果

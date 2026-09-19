@@ -10,7 +10,7 @@
 #include "logger/Logger.h"
 #include "socket/SocketManager.h"
 #include "context/EpollContext.h"
-#include "redis.h"
+#include "../../src/app/redis/redis.h"
 
 // 简单测试宏
 #define CHECK(cond, msg) \

@@ -5,7 +5,7 @@
 #include <chrono>
 #include <atomic>
 #include <random>
-#include "SimpleRedisClient.h"
+#include "../../src/app/redis/SimpleRedisClient.h"
 #include "logger/Logger.h"
 
 // 辅助函数：生成随机字符串
