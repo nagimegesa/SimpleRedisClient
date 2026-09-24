@@ -9,7 +9,8 @@
 
 struct Hello : RpcService<Hello> {
     virtual void setup(RpcServer& server) override {
-        registerFunction(server, "HelloService", "hello", &Hello::hello);
+        registerServiceName(server, "HelloService");
+        registerFunction(server, "hello", &Hello::hello);
     }
 
     HelloWorldResponse hello(HelloWorldRequest req) {

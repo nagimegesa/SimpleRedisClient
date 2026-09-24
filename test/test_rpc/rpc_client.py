@@ -5,11 +5,14 @@ RPC 客户端冒烟测试
 
 请求协议:
   0x0a 0x0b
-  type        (1 字节)  1 = REQUEST
-  request_id  (8 字节, 大端, 无符号, 不能为 0)
-  name_len    (1 字节)
-  function name
-  param_len   (4 字节, 大端)
+  type          (1 字节)  1 = REQUEST
+  request_id    (8 字节, 大端, 无符号, 不能为 0)
+  error_code    (1 字节)  client 发送时固定 0
+  service_len   (1 字节)
+  service_name
+  func_len      (1 字节)
+  func_name
+  param_len     (4 字节, 大端)
   serialized param
   0x0b 0x0c
 
@@ -18,7 +21,7 @@ RPC 客户端冒烟测试
     0x0a 0x0b
     type        (1 字节)  2 = RESPONSE
     request_id  (8 字节, 大端)
-    name_len    (1 字节)  服务端固定 0
+    error_code  (1 字节)  固定 0
     param_len   (4 字节, 大端)
     serialized body
     0x0b 0x0c
@@ -28,7 +31,7 @@ RPC 客户端冒烟测试
     type        (1 字节)  3 = ERROR
     request_id  (8 字节, 大端)
     error_code  (1 字节)
-    param_len   (4 字节, 大端) 服务端固定 0
+    param_len   (4 字节, 大端) 固定 0
     0x0b 0x0c
 """
 
@@ -65,6 +68,9 @@ RECV_SIZE = 65536
 
 DEBUG_RAW = False
 
+# 默认 service 名（新协议里多了一层 service）
+DEFAULT_SERVICE = "HelloService"
+
 ERROR_NAMES = {
     1: "ERR_BAD_REQUEST",
     3: "ERR_BAD_INTERNAL",
@@ -87,23 +93,33 @@ def next_request_id() -> int:
 
 # ---------------------- 请求打包 ----------------------
 
-def build_packet(func_name: str, request, request_id: int = None) -> bytes:
+def build_packet(
+        service_name: str,
+        func_name: str,
+        request,
+        request_id: int = None,
+) -> bytes:
     if request_id is None:
         request_id = next_request_id()
 
     assert 0 < request_id <= 0xFFFFFFFFFFFFFFFF, "request_id must be non-zero u64"
 
-    name_b = func_name.encode("utf-8")
+    svc_b = service_name.encode("utf-8")
+    func_b = func_name.encode("utf-8")
     param_b = request.SerializeToString()
 
-    assert len(name_b) <= 0xFF, "function name too long"
+    assert len(svc_b) <= 0xFF, "service name too long"
+    assert len(func_b) <= 0xFF, "function name too long"
 
     pkt = bytearray()
     pkt += START
     pkt.append(REQUEST_TYPE)                          # type (1B)
     pkt += struct.pack(REQUEST_ID_FMT, request_id)    # request_id (8B, BE)
-    pkt.append(len(name_b))                           # name_len (1B)
-    pkt += name_b                                     # function name
+    pkt.append(0)                                     # error_code (1B) = 0
+    pkt.append(len(svc_b))                            # service_len (1B)
+    pkt += svc_b                                      # service_name
+    pkt.append(len(func_b))                           # func_len (1B)
+    pkt += func_b                                     # function name
     pkt += struct.pack(PARAM_LEN_FMT, len(param_b))   # param_len (4B, BE)
     pkt += param_b                                    # serialized param
     pkt += END
@@ -111,9 +127,8 @@ def build_packet(func_name: str, request, request_id: int = None) -> bytes:
     return bytes(pkt)
 
 
-
 # extra:
-#   RESPONSE_TYPE -> name_len
+#   RESPONSE_TYPE -> error_code (固定 0)
 #   ERROR_TYPE    -> error_code
 Frame = namedtuple("Frame", ["type", "request_id", "body", "extra"])
 
@@ -145,6 +160,11 @@ class RpcClient:
         """
         尝试从 self._buf 中解析一个完整响应帧。
         解析成功则消费缓冲区并返回 Frame；数据不足返回 None。
+
+        帧布局:
+          START(2) | type(1) | request_id(8) | error_code(1) |
+          param_len(4) | body(param_len) | END(2)
+        固定头部 16 字节，帧总长 18 + param_len。
         """
         buf = self._buf
 
@@ -174,11 +194,12 @@ class RpcClient:
             del buf[0]
             return None
 
-        # start(2) + type(1) + request_id(8) + name_len/error_code(1) + param_len(4)
+        # start(2) + type(1) + request_id(8) + error_code(1) + param_len(4)
         if len(buf) < 16:
             return None
 
         request_id = struct.unpack(">Q", buf[3:11])[0]
+        error_code = buf[11]
         param_len = struct.unpack(">I", buf[12:16])[0]
 
         # 成功帧和错误帧长度都是 18 + param_len
@@ -193,10 +214,8 @@ class RpcClient:
             del buf[:2]
             return None
 
-        extra = buf[11]  # RESPONSE: name_len, ERROR: error_code
-
         del buf[:total]
-        return Frame(frame_type, request_id, body, extra)
+        return Frame(frame_type, request_id, body, error_code)
 
     def _recv_frame(self, expect_request_id: int) -> Frame:
         """
@@ -232,11 +251,22 @@ class RpcClient:
 
             self._buf.extend(chunk)
 
-    def call(self, func_name: str, request, request_id: int = None):
+    def call(
+            self,
+            func_name: str,
+            request,
+            request_id: int = None,
+            service_name: str = DEFAULT_SERVICE,
+    ):
         if request_id is None:
             request_id = next_request_id()
 
-        pkt = build_packet(func_name, request, request_id=request_id)
+        pkt = build_packet(
+            service_name=service_name,
+            func_name=func_name,
+            request=request,
+            request_id=request_id,
+        )
         self.sock.sendall(pkt)
 
         frame = self._recv_frame(request_id)
@@ -245,6 +275,10 @@ class RpcClient:
             raise RpcError(frame.extra)
 
         # frame.type == RESPONSE_TYPE
+        # error_code 字段固定为 0；若不是，说明协议异常
+        if frame.extra != 0:
+            raise RpcError(frame.extra)
+
         resp = hello_pb2.HelloWorldResponse()
         resp.ParseFromString(frame.body)
         return resp
@@ -262,12 +296,12 @@ class RpcClient:
         self.close()
 
 
-
-def check(client: RpcClient, name: str, req_msg: str, expect: str):
+def check(client: RpcClient, name: str, req_msg: str, expect: str,
+          service_name: str = DEFAULT_SERVICE, func_name: str = "hello"):
     req = hello_pb2.HelloWorldRequest()
     req.msg = req_msg
 
-    resp = client.call("hello", req)
+    resp = client.call(func_name, req, service_name=service_name)
 
     ok = resp.res == expect
     flag = "PASS" if ok else "FAIL"
@@ -275,12 +309,19 @@ def check(client: RpcClient, name: str, req_msg: str, expect: str):
     assert ok, f"{name} failed"
 
 
-def check_error(client: RpcClient, name: str, func_name: str, req_msg: str, expect_code: int):
+def check_error(
+        client: RpcClient,
+        name: str,
+        func_name: str,
+        req_msg: str,
+        expect_code: int,
+        service_name: str = DEFAULT_SERVICE,
+):
     req = hello_pb2.HelloWorldRequest()
     req.msg = req_msg
 
     try:
-        client.call(func_name, req)
+        client.call(func_name, req, service_name=service_name)
     except RpcError as e:
         ok = e.code == expect_code
         flag = "PASS" if ok else "FAIL"

@@ -9,6 +9,7 @@
 #include "context/EpollContext.h"
 #include "logger/Logger.h"
 #include "socket/SocketManager.h"
+#include "Nacos.h"
 
 using RpcHandler = std::function<std::string(std::string)>;
 
@@ -16,21 +17,27 @@ using RpcHandler = std::function<std::string(std::string)>;
  * 0x0a 0x0b    // 2
  * type 1 字节  1 = REQUEST 2 = RESPONSE 3 = ERROR server端只会接收到 1 // 3
  * request_id   8 字节 大端 无符号，不能为 0 // 11
- * name_len 1 字节 // 12
- * function name for name_len // 12 + name_len
- * parma_len  4 字节 大端  // 16 + name_len
- * serialize parma for parma_len // 16 + name_len + parma_len
- * 0x0b 0x0c // 18 + name_len + parma_len
+ * error_code  1 字节，server 端只会接收到 0 // 12
+ * service_len 1 字节 // 13
+ * service_name for service_len
+ * func_len 1 字节 // 14 + service_len
+ * function name for func_len // 14 + service_len + func_len
+ * parma_len  4 字节 大端  // 18 + service_len + func_len
+ * serialize parma for parma_len // 18 + service_len + func_len + parma_len
+ * 0x0b 0x0c // 20 + service_len + func_len + parma_len
  */
 
 enum ParserStatus {
     SOA, SOB,
     TYPE,
     REQUEST_ID,
+    ERROR_CODE,
+    SERVICE_LEN,
+    SERVICE_NAME,
     FUNC_LEN,
     FUNC_NAME,
-    PARMA_LEN,
-    PARMA_STRING,
+    PARAM_LEN,
+    PARAM_STRING,
     EOB, EOC,
 };
 
@@ -40,7 +47,7 @@ enum ParserResult {
     ERROR,
 };
 
-enum ErrorCode {
+enum ErrorCode : char {
     ERR_BAD_REQUEST = 1,
     ERR_BAD_INTERNAL = 3,
 
@@ -59,70 +66,106 @@ struct RpcContext {
     ParserStatus status;
     ParserResult result;
     std::uint64_t request_id;
-    std::string name;
-    std::string parms;
+    std::string service_name;
+    std::string func_name;
+    std::string params;
     std::vector<char> buffer;
 
-    RpcContext() : status(SOA), result(WAITING), request_id(0), name(), parms(), buffer() {}
+    RpcContext() : status(SOA), result(WAITING), request_id(0) {}
+
+    void reset_message() {
+        request_id = 0;
+        service_name.clear();
+        func_name.clear();
+        params.clear();
+        buffer.clear();
+    }
 };
 
 namespace {
 
-    inline void append_u64_be(std::string& out, std::uint64_t v) {
-        for (int shift = 56; shift >= 0; shift -= 8) {
-            out.push_back(static_cast<char>((v >> shift) & 0xff));
-        }
-    }
+constexpr unsigned char kMagic0 = 0x0a;
+constexpr unsigned char kMagic1 = 0x0b;
+constexpr unsigned char kMagic2 = 0x0c;
 
-    inline void append_u32_be(std::string& out, std::uint32_t v) {
-        out.push_back(static_cast<char>((v >> 24) & 0xff));
-        out.push_back(static_cast<char>((v >> 16) & 0xff));
-        out.push_back(static_cast<char>((v >> 8)  & 0xff));
-        out.push_back(static_cast<char>( v        & 0xff));
+inline unsigned char u8(char c) {
+    return static_cast<unsigned char>(c);
+}
+
+inline void append_u64_be(std::string& out, std::uint64_t v) {
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<char>((v >> shift) & 0xff));
     }
+}
+
+inline void append_u32_be(std::string& out, std::uint32_t v) {
+    out.push_back(static_cast<char>((v >> 24) & 0xff));
+    out.push_back(static_cast<char>((v >> 16) & 0xff));
+    out.push_back(static_cast<char>((v >> 8) & 0xff));
+    out.push_back(static_cast<char>(v & 0xff));
+}
+
+inline std::uint64_t read_u64_be(const char* p) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v = (v << 8) | static_cast<unsigned char>(p[i]);
+    }
+    return v;
+}
+
+inline std::uint32_t read_u32_be(const char* p) {
+    std::uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+        v = (v << 8) | static_cast<unsigned char>(p[i]);
+    }
+    return v;
+}
+
+inline void append_magic_begin(std::string& out) {
+    out.push_back(static_cast<char>(kMagic0));
+    out.push_back(static_cast<char>(kMagic1));
+}
+
+inline void append_magic_end(std::string& out) {
+    out.push_back(static_cast<char>(kMagic1));
+    out.push_back(static_cast<char>(kMagic2));
+}
 
 }  // namespace
 
 // 0x0a 0x0b | type(3) | request_id(8) | error_code(1) | param_len(4)=0 | 0x0b 0x0c
-// 共 18 字节
 std::string buildErrorResponse(std::uint64_t request_id, char error_code) {
     std::string res;
     res.reserve(18);
 
-    res.push_back(0x0a);
-    res.push_back(0x0b);
-    res.push_back(static_cast<char>(RequestType::REQ_ERROR));  // 3
+    append_magic_begin(res);
+    res.push_back(static_cast<char>(RequestType::REQ_ERROR));
     append_u64_be(res, request_id);
-    res.push_back(error_code);        // 复用 name_len 那 1 字节
-    append_u32_be(res, 0);            // param_len = 0
-    res.push_back(0x0b);
-    res.push_back(0x0c);
+    res.push_back(error_code);
+    append_u32_be(res, 0); // parma_len 0
+    append_magic_end(res);
 
     return res;
 }
 
-// 0x0a 0x0b | type(2) | request_id(8) | name_len(1)=0 | param_len(4) | body | 0x0b 0x0c
-// 共 18 + body.size() 字节
-std::string buildResponse(std::string&& body, std::uint64_t request_id) {
-    const std::size_t body_len = body.size();
-
+// 0x0a 0x0b | type(2) | request_id(8) | error_code(1)=0 |
+// param_len(4) | body | 0x0b 0x0c
+std::string buildResponse(const std::string& body, std::uint64_t request_id) {
     std::string res;
-    res.reserve(18 + body_len);
+    res.reserve(18 + body.size());
 
-    res.push_back(0x0a);
-    res.push_back(0x0b);
-    res.push_back(static_cast<char>(RequestType::RESPONSE));   // 2
+    append_magic_begin(res);
+    res.push_back(static_cast<char>(RequestType::RESPONSE));
     append_u64_be(res, request_id);
-    res.push_back(0x00);              // name_len = 0
-    append_u32_be(res, static_cast<std::uint32_t>(body_len));
+    res.push_back(0);   // error code 0
+    append_u32_be(res, static_cast<std::uint32_t>(body.size()));
     res.append(body);
-    res.push_back(0x0b);
-    res.push_back(0x0c);
+    append_magic_end(res);
 
     return res;
 }
 
-void parse(
+inline void parse(
     const std::string& buffer,
     std::size_t start,
     std::size_t end,
@@ -130,6 +173,7 @@ void parse(
     RpcContext& context) {
 
     parsed = 0;
+
     if (start >= end) {
         context.result = WAITING;
         return;
@@ -137,117 +181,172 @@ void parse(
 
     const char* data = buffer.data();
     std::size_t i = start;
+
     context.result = WAITING;
 
-    auto u8 = [](char c) -> unsigned char {
-        return static_cast<unsigned char>(c);
+    auto set_waiting = [&]() {
+        parsed = i - start;
+        context.result = WAITING;
     };
 
     auto set_error = [&]() {
         context.result = ERROR;
         context.status = SOA;
-        context.request_id = 0;
-        context.name.clear();
-        context.parms.clear();
-        context.buffer.clear();
+        context.reset_message();
         parsed = i - start;
+    };
+
+    // 从 buffer + data 中凑齐 need 个字节，放入 context.buffer
+    auto read_fixed = [&](std::size_t need) -> bool {
+        while (context.buffer.size() < need && i < end) {
+            context.buffer.push_back(data[i++]);
+        }
+
+        if (context.buffer.size() < need) {
+            set_waiting();
+            return false;
+        }
+
+        return true;
+    };
+
+    // 读取变长字段
+    auto read_var = [&](std::size_t len, std::string& out) -> bool {
+        if (out.size() > len) {
+            set_error();
+            return false;
+        }
+
+        if (out.capacity() < len) {
+            out.reserve(len);
+        }
+
+        const std::size_t remain = len - out.size();
+        if (remain > 0) {
+            const std::size_t avail = end - i;
+            const std::size_t take = std::min(remain, avail);
+
+            out.append(data + i, take);
+            i += take;
+
+            if (out.size() < len) {
+                set_waiting();
+                return false;
+            }
+        }
+
+        return true;
     };
 
     while (i < end) {
         switch (context.status) {
         case SOA: {
-            // 查找起始字节 0x0a
-            const void* p = std::memchr(data + i, 0x0a, end - i);
+            const void* p = std::memchr(data + i, kMagic0, end - i);
             if (p == nullptr) {
                 i = end;
-                parsed = i - start;
-                context.result = WAITING;
+                set_waiting();
                 return;
             }
+
             i = static_cast<const char*>(p) - data + 1;
             context.status = SOB;
             break;
         }
 
         case SOB: {
-            if (u8(data[i]) != 0x0b) {
+            if (u8(data[i]) != kMagic1) {
                 set_error();
                 return;
             }
+
             ++i;
-
-            context.request_id = 0;
-            context.name.clear();
-            context.parms.clear();
-            context.buffer.clear();
-
+            context.reset_message();
             context.status = TYPE;
             break;
         }
 
         case TYPE: {
             if (i >= end) {
-                parsed = i - start;
-                context.result = WAITING;
+                set_waiting();
                 return;
             }
 
             const unsigned char type = u8(data[i++]);
 
             // server 端只接收 REQUEST
-            if (type != REQUEST) {
+            if (type != static_cast<unsigned char>(RequestType::REQUEST)) {
                 set_error();
                 return;
             }
 
-            context.buffer.clear();
             context.status = REQUEST_ID;
             break;
         }
 
         case REQUEST_ID: {
-            constexpr std::size_t need = 8;
-
-            // 如果有 8 个字节
-            if (context.buffer.empty() && (end - i) >= need) {
-                std::uint64_t id = 0;
-                for (std::size_t k = 0; k < need; ++k) {
-                    id = (id << 8) | u8(data[i + k]);
-                }
-                i += need;
-
-                if (id == 0) {
-                    set_error();
-                    return;
-                }
-
-                context.request_id = id;
-                context.status = FUNC_LEN;
-                break;
-            }
-
-            // 跨包暂存
-            while (context.buffer.size() < need && i < end) {
-                context.buffer.push_back(data[i++]);
-            }
-
-            if (context.buffer.size() < need) {
-                parsed = i - start;
-                context.result = WAITING;
+            if (!read_fixed(8)) {
                 return;
             }
 
-            std::uint64_t id = 0;
-            for (std::size_t k = 0; k < need; ++k) {
-                id = (id << 8) | u8(context.buffer[k]);
-            }
-
-            if (id == 0) {  // id 不能为 0
+            const std::uint64_t id = read_u64_be(context.buffer.data());
+            if (id == 0) {
                 set_error();
                 return;
             }
 
             context.request_id = id;
+            context.buffer.clear();
+            context.status = ERROR_CODE;
+            break;
+        }
+
+        case ERROR_CODE: {
+            if (i >= end) {
+                set_waiting();
+                return;
+            }
+
+            const unsigned char error_code = u8(data[i++]);
+
+            // server 端收到的 REQUEST，error_code 必须为 0
+            if (error_code != 0) {
+                set_error();
+                return;
+            }
+
+            context.status = SERVICE_LEN;
+            break;
+        }
+
+        case SERVICE_LEN: {
+            if (i >= end) {
+                set_waiting();
+                return;
+            }
+
+            const unsigned char len = u8(data[i++]);
+
+            context.service_name.clear();
+            context.service_name.reserve(len);
+
+            context.buffer.clear();
+            context.buffer.push_back(static_cast<char>(len));
+
+            context.status = SERVICE_NAME;
+            break;
+        }
+
+        case SERVICE_NAME: {
+            if (context.buffer.empty()) {
+                set_error();
+                return;
+            }
+
+            const std::size_t len = u8(context.buffer[0]);
+            if (!read_var(len, context.service_name)) {
+                return;
+            }
+
             context.buffer.clear();
             context.status = FUNC_LEN;
             break;
@@ -255,18 +354,17 @@ void parse(
 
         case FUNC_LEN: {
             if (i >= end) {
-                parsed = i - start;
-                context.result = WAITING;
+                set_waiting();
                 return;
             }
 
-            const unsigned char name_len = u8(data[i++]);
+            const unsigned char len = u8(data[i++]);
 
-            context.name.clear();
-            context.name.reserve(name_len);
+            context.func_name.clear();
+            context.func_name.reserve(len);
 
             context.buffer.clear();
-            context.buffer.push_back(static_cast<char>(name_len));
+            context.buffer.push_back(static_cast<char>(len));
 
             context.status = FUNC_NAME;
             break;
@@ -278,86 +376,35 @@ void parse(
                 return;
             }
 
-            const std::size_t name_len = u8(context.buffer[0]);
-
-            if (context.name.size() > name_len) {
-                set_error();
+            const std::size_t len = u8(context.buffer[0]);
+            if (!read_var(len, context.func_name)) {
                 return;
-            }
-
-            const std::size_t remain = name_len - context.name.size();
-            if (remain > 0) {
-                const std::size_t avail = end - i;
-                const std::size_t take = remain < avail ? remain : avail;
-
-                context.name.append(data + i, take);
-                i += take;
-
-                if (context.name.size() < name_len) {
-                    parsed = i - start;
-                    context.result = WAITING;
-                    return;
-                }
             }
 
             context.buffer.clear();
-            context.status = PARMA_LEN;
+            context.status = PARAM_LEN;
             break;
         }
 
-        case PARMA_LEN: {
-            constexpr std::size_t need = 4;
-
-            while (context.buffer.size() < need && i < end) {
-                context.buffer.push_back(data[i++]);
-            }
-
-            if (context.buffer.size() < need) {
-                parsed = i - start;
-                context.result = WAITING;
+        case PARAM_LEN: {
+            if (!read_fixed(4)) {
                 return;
             }
 
-            context.parms.clear();
-            context.status = PARMA_STRING;
+            context.params.clear();
+            context.status = PARAM_STRING;
             break;
         }
 
-        case PARMA_STRING: {
+        case PARAM_STRING: {
             if (context.buffer.size() < 4) {
                 set_error();
                 return;
             }
 
-            // 大端
-            const std::uint32_t param_len =
-                (static_cast<std::uint32_t>(u8(context.buffer[0])) << 24) |
-                (static_cast<std::uint32_t>(u8(context.buffer[1])) << 16) |
-                (static_cast<std::uint32_t>(u8(context.buffer[2])) << 8)  |
-                (static_cast<std::uint32_t>(u8(context.buffer[3])));
-
-            if (context.parms.size() > param_len) {
-                set_error();
+            const std::uint32_t param_len = read_u32_be(context.buffer.data());
+            if (!read_var(static_cast<std::size_t>(param_len), context.params)) {
                 return;
-            }
-
-            if (context.parms.capacity() < param_len) {
-                context.parms.reserve(param_len);
-            }
-
-            const std::size_t remain = param_len - context.parms.size();
-            if (remain > 0) {
-                const std::size_t avail = end - i;
-                const std::size_t take = remain < avail ? remain : avail;
-
-                context.parms.append(data + i, take);
-                i += take;
-
-                if (context.parms.size() < param_len) {
-                    parsed = i - start;
-                    context.result = WAITING;
-                    return;
-                }
             }
 
             context.buffer.clear();
@@ -367,12 +414,11 @@ void parse(
 
         case EOB: {
             if (i >= end) {
-                parsed = i - start;
-                context.result = WAITING;
+                set_waiting();
                 return;
             }
 
-            if (u8(data[i]) != 0x0b) {
+            if (u8(data[i]) != kMagic1) {
                 set_error();
                 return;
             }
@@ -384,12 +430,11 @@ void parse(
 
         case EOC: {
             if (i >= end) {
-                parsed = i - start;
-                context.result = WAITING;
+                set_waiting();
                 return;
             }
 
-            if (u8(data[i]) != 0x0c) {
+            if (u8(data[i]) != kMagic2) {
                 set_error();
                 return;
             }
@@ -403,20 +448,37 @@ void parse(
         }
     }
 
-    parsed = end - start;
-    context.result = WAITING;
+    set_waiting();
 }
 
 struct RpcServer::RpcServerImpl {
 private:
+
+    struct PairStringHash {
+        std::size_t operator()(const std::pair<std::string, std::string>& p) const {
+            std::hash<std::string> hasher;
+            return hasher(p.first) ^ hasher(p.second);
+        }
+    };
+
     std::shared_ptr<EpollContext> context_;
     std::set<std::unique_ptr<RpcServiceBase>> services_; // 保留Service防止被析构
-    std::unordered_map<std::string, RpcHandler> handlers_;
+    std::unordered_map<std::pair<std::string, std::string>, RpcHandler, PairStringHash> handlers_;
     std::shared_ptr<ISocket> socket_;
     ThreadPool threadPool_;
+    std::unique_ptr<nacos::NamingService> namingService_;
+
+    std::string server_ip;
+    short server_port = 0;
+    bool use_nacos = true;
+
+    static constexpr std::string NACOS_SERVER_ADDRESS = "127.0.0.1:8848";
+    static constexpr std::string NACOS_USER_NAME = "nacos";
+    static constexpr std::string NACOS_PASSWORD = "nacos";
+
 
 public:
-    RpcServerImpl(): context_(std::make_shared<EpollContext>()), threadPool_(2) {
+    RpcServerImpl(): context_(std::make_shared<EpollContext>()), threadPool_(2), namingService_(nullptr) {
         socket_ = SocketManager::getInstance().getSocket(context_);
         socket_->asyncAccept([this](const std::shared_ptr<ISocket>& client) {
             client->getContext()->postTask(client, [this, client]() {
@@ -473,11 +535,11 @@ public:
         if (context.result == ERROR) {
             response = buildErrorResponse(context.request_id, ERR_BAD_REQUEST);
         } else if (context.result == COMPLETE) {
-            if (handlers_.contains(context.name)) {
-                LOG(DEBUG) << "Rpc server: dispatch function " << context.name;
+            if (handlers_.contains(std::pair{context.service_name, context.func_name})) {
+                LOG(DEBUG) << "Rpc server: dispatch function " << context.func_name;
                 try {
-                    std::string res = handlers_[context.name](std::move(context.parms));
-                    response = buildResponse(std::move(res), context.request_id);
+                    std::string res = handlers_[std::pair{context.service_name, context.func_name}](std::move(context.params));
+                    response = buildResponse(res, context.request_id);
                 } catch (BadParamException& e) {
                     response = buildErrorResponse(context.request_id, ERR_UNKNOWN_PARAM);
                 } catch (BadResponseException& e) {
@@ -509,28 +571,44 @@ public:
     }
 
     void addHandler(const std::string& group, const std::string& name, RpcHandler&& handler) {
-        registerDiscovery(group, name);
-        handlers_[name] = std::move(handler);
+        LOG(DEBUG) << "RpcServer:: addHandler " << group << " " << name;
+        handlers_[std::pair{group, name}] = std::move(handler);
     }
 
     bool bindAndListen(const char* ip, short port) {
+        using namespace nacos;
         if (socket_->bind(ip, port) &&
             socket_->listen(ISocket::DEFAULT_BACKLOG)) {
 
-            // Properties props;
-            // props[PropertyKeyConst::SERVER_ADDR] = "127.0.0.1:8848";//Server address
-            // props[PropertyKeyConst::AUTH_PASSWORD] = "nacos";
-            // props[PropertyKeyConst::AUTH_USERNAME] = "nacos";
-            // auto *factory = nacos::NacosFactoryFactory::getNacosFactory(props);
-            // NamingService* nameService = factory->CreateNamingService();
+            server_ip = ip;
+            server_port = port;
+            try {
+                Properties props;
+                props[PropertyKeyConst::SERVER_ADDR] = NACOS_SERVER_ADDRESS;
+                props[PropertyKeyConst::AUTH_PASSWORD] = NACOS_PASSWORD;
+                props[PropertyKeyConst::AUTH_USERNAME] = NACOS_USER_NAME;
+                auto *factory = nacos::NacosFactoryFactory::getNacosFactory(props);
 
+                ResourceGuard _(factory);
+                NamingService* nameService = factory->CreateNamingService();
+                this->namingService_ = std::unique_ptr<NamingService>(nameService);
+            } catch (NacosException& e) {
+                LOG(WARNING) << "Rpc Server: create nacos discovery service failed";
+                use_nacos = false;
+            }
             return true;
         }
         return false;
     }
 
-    void registerDiscovery(const std::string& group, const std::string& name) {
-
+    void registerDiscovery(const std::string& name) {
+        try {
+            if (use_nacos) {
+                this->namingService_->registerInstance(name, server_ip, server_port);
+            }
+        } catch (nacos::NacosException& e) {
+            LOG(DEBUG) << "Rpc server: failed to register a server to nacos " << name;
+        }
     }
 };
 
@@ -552,6 +630,10 @@ void RpcServer::close() {
 
 bool RpcServer::bindAndListen(const char* ip, short port) {
     return impl->bindAndListen(ip, port);
+}
+
+void RpcServer::registerServiceName(const std::string& name) {
+    impl->registerDiscovery(name);
 }
 
 RpcServer::RpcServer() : impl(std::make_unique<RpcServerImpl>()){}

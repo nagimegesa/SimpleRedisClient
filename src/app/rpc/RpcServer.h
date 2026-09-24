@@ -44,6 +44,7 @@ public:
     void run(bool block=false);
     void close();
     bool bindAndListen(const char* ip, short port);
+    void registerServiceName(const std::string& name);
     RpcServer();
     ~RpcServer();
 };
@@ -51,6 +52,11 @@ public:
 struct RpcServiceBase {
     virtual      ~RpcServiceBase() = default;
     virtual void setup(RpcServer& server) = 0;
+};
+
+class RpcException : public std::runtime_error {
+public:
+    explicit RpcException(const std::string& msg) : std::runtime_error(msg) {}
 };
 
 class BadParamException : public std::runtime_error {
@@ -65,10 +71,14 @@ public:
 
 template<typename Derived>
 struct RpcService : RpcServiceBase {
+
+    std::string serviceName;
+    void registerServiceName(RpcServer& server, const std::string& name);
+
     template <typename Ret, typename Arg> requires std::is_base_of_v<::google::protobuf::Message, Ret>
     && std::is_base_of_v<::google::protobuf::Message, Arg>
-    void registerFunction(RpcServer& server, const std::string& group, const std::string& name, Ret(Derived::*func)(Arg arg)) {
-        server.addHandler(group, name,
+    void registerFunction(RpcServer& server, const std::string& name, Ret(Derived::*func)(Arg arg)) {
+        server.addHandler(serviceName, name,
                           [func, this](const std::string& buffer) -> std::string {
                               Arg req;
                               if (!req.ParseFromString(buffer)) {
@@ -85,8 +95,8 @@ struct RpcService : RpcServiceBase {
     }
 
     template<typename Ret> requires std::is_base_of_v<::google::protobuf::Message, Ret>
-    void registerFunction(RpcServer& server, const std::string& group, const std::string& name, Ret(Derived::*func)()) {
-        server.addHandler(group, name,
+    void registerFunction(RpcServer& server, const std::string& name, Ret(Derived::*func)()) {
+        server.addHandler(serviceName, name,
                           [func, this](const std::string&) -> std::string {
                               Ret         ret = (static_cast<Derived*>(this)->*func)();
                               std::string out;
@@ -99,8 +109,8 @@ struct RpcService : RpcServiceBase {
     }
 
     template <typename Arg> requires std::is_base_of_v<::google::protobuf::Message, Arg>
-    void registerFunction(RpcServer& server, const std::string& group, const std::string& name, void(Derived::*func)(Arg arg)) {
-        server.addHandler(group, name,
+    void registerFunction(RpcServer& server, const std::string& name, void(Derived::*func)(Arg arg)) {
+        server.addHandler(serviceName, name,
                           [func, this](const std::string& buffer) -> std::string {
                               Arg req;
                               if (!req.ParseFromString(buffer)) {
@@ -112,8 +122,8 @@ struct RpcService : RpcServiceBase {
         );
     }
 
-    void registerFunction(RpcServer& server, const std::string& group, const std::string& name, void(Derived::*func)()) {
-        server.addHandler(group, name,
+    void registerFunction(RpcServer& server, const std::string& name, void(Derived::*func)()) {
+        server.addHandler(serviceName, name,
                           [func, this](const std::string& buffer) -> std::string {
                               (static_cast<Derived*>(this)->*func)();
                               return "";
@@ -130,5 +140,11 @@ protected:
     RpcService()                   = default;
     virtual ~RpcService() override = default;
 };
+
+template <typename Derived>
+void RpcService<Derived>::registerServiceName(RpcServer& server, const std::string& name) {
+    serviceName = name;
+    server.registerServiceName(name);
+}
 
 #endif //DEMO_RPCSERVER_H
