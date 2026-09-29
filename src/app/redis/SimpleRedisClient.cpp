@@ -61,14 +61,14 @@ struct SimpleRedisClient::ClientImpl {
                 return this->read(client, buf, sz);
             });
 
-            client.socket->registerHighLevelCallback([&client](const std::shared_ptr<ISocket>& socket) {
-                LOG(WARNING) << "SimpleRedisClient: HighLevelCallback is call, stop for write";
-                client.highLevel = true;
-            });
-
-            client.socket->registerLowLevelCallback([&client](const std::shared_ptr<ISocket>& socket) {
-                client.highLevel = false;
-            });
+            // client.socket->registerHighLevelCallback([&client](const std::shared_ptr<ISocket>& socket) {
+            //     LOG(WARNING) << "SimpleRedisClient: HighLevelCallback is call, stop for write";
+            //     client.highLevel = true;
+            // });
+            //
+            // client.socket->registerLowLevelCallback([&client](const std::shared_ptr<ISocket>& socket) {
+            //     client.highLevel = false;
+            // });
         }
         epollContext->run();
         return true;

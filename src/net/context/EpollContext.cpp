@@ -121,8 +121,13 @@ public:
             while (!task_queue_.push(std::move(task))) {} // push 可能返回 False 需要不断尝试
         }
 
-        if (bool except = false; awake.compare_exchange_weak(except, true, std::memory_order_acq_rel)) {
-            // 唤醒 epoll_wait
+        // if (bool except = false; awake.compare_exchange_weak(except, true, std::memory_order_acq_rel)) {
+        //     // 唤醒 epoll_wait
+        //     uint64_t one = 1;
+        //     ::write(wakeup_fd_, &one, sizeof(one));
+        // }
+
+        if (!awake.exchange(true, std::memory_order_release)) { // 如果 exchange 返回 false, 之前就是 false
             uint64_t one = 1;
             ::write(wakeup_fd_, &one, sizeof(one));
         }
@@ -182,11 +187,20 @@ private:
         //     tasks.front()();
         //     tasks.pop();
         // }
-        awake.store(false, std::memory_order_release);
+
         std::function<void()> task;
 
-        while (task_queue_.pop(task)) {
+        while (task_queue_.pop(task)) { // 如果 pop 失败，下次在处理，这里不能保证 queue 是空
             task();
+        }
+
+        awake.store(false, std::memory_order_release);
+        // 如果 post task 提交了一个任务，在 store false 前，where 循环后，这个任务可能被丢失，所以这里再检查一次
+        if (!task_queue_.empty()) {
+            if (!awake.exchange(true, std::memory_order_release)) {
+                uint64_t one = 1;
+                ::write(wakeup_fd_, &one, sizeof(one));
+            }
         }
     }
 

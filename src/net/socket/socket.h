@@ -11,7 +11,7 @@ class SocketManager;
 class EpollContext;
 class ISocket;
 
-using AcceptContextCallback = std::function<void(std::shared_ptr<ISocket> client)>;
+using AcceptContextCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
 using ReadContextCallBack = std::function<std::size_t(const std::string&, int size)>;
 using HighLevelCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
 using LowLevelCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
