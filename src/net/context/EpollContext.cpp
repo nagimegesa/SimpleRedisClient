@@ -23,13 +23,14 @@
 
 // 写元信息
 struct WriteMetaInfo {
-    std::shared_ptr<ISocket> socket;
+    // std::shared_ptr<ISocket> socket;
     std::shared_ptr<std::string> buffer;
     size_t offset = 0;
     WriteContextCallBack callback;
 
-    WriteMetaInfo(std::shared_ptr<ISocket> s, WriteContextCallBack cb, std::shared_ptr<std::string> buf)
-        : socket(std::move(s)), buffer(std::move(buf)), callback(std::move(cb)) {}
+    // WriteMetaInfo(std::shared_ptr<ISocket> s, WriteContextCallBack cb, std::shared_ptr<std::string> buf)
+    //     : socket(std::move(s)), buffer(std::move(buf)), callback(std::move(cb)) {}
+    WriteMetaInfo(WriteContextCallBack&& cb, std::shared_ptr<std::string>&& buf) : buffer(std::move(buf)), callback(std::move(cb)) {}
 };
 
 // ------------------------- 内部结构定义 -------------------------
@@ -114,8 +115,7 @@ public:
         }
     }
 
-    // 提交任务到本线程的事件循环
-    void postTask(std::function<void()> task) {
+    void postTask(std::function<void()>&& task) { // 这里实际上只会接收右值
         {
             // std::lock_guard<std::mutex> lock(task_mutex_);
             while (!task_queue_.push(std::move(task))) {} // push 可能返回 False 需要不断尝试
@@ -502,12 +502,12 @@ public:
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
     }
 
-    void doAsyncWriteOnce(int fd, const std::shared_ptr<ISocket>& socket,
-                          const WriteContextCallBack& callback, const std::shared_ptr<std::string>& buf) {
+    void doAsyncWriteOnce(int fd, std::shared_ptr<ISocket>&& socket,
+                          WriteContextCallBack&& callback, std::shared_ptr<std::string>&& buf) {
         // 如果连接不存在，则创建一个只写连接
         auto it = connections_.find(fd);
         if (it == connections_.end()) {
-            auto conn = std::make_shared<Connection>(socket, nullptr);
+            auto conn = std::make_shared<Connection>(std::move(socket), nullptr);
             conn->write_registered = true;
             connections_[fd] = conn;
 
@@ -523,8 +523,8 @@ public:
         // 因为 removeSocket 不可能在这个函数内被调用
         auto& conn = it->second;
         int size = static_cast<int>(buf->size());
-        conn->write_queue.emplace_back(socket, callback, buf);
-
+        // conn->write_queue.emplace_back(socket, callback, buf);
+        conn->write_queue.emplace_back(std::move(callback), std::move(buf));
         // 高水位背压
         conn->in_queue_write_buffer_byte_size += size;
         if (conn->in_queue_write_buffer_byte_size > ISocket::DEFAULT_HIGH_LEVEL_SIZE) {
@@ -668,11 +668,52 @@ public:
 
     void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback,
                         const std::shared_ptr<std::string>& buf) {
+        // if (int fd = -1; checkSocket(socket, fd)) {
+        //     size_t index = std::hash<int>{}(fd) % loops_.size();
+        //     loops_[index]->postTask([this, index, fd, socket, callback, buf] {
+        //         loops_[index]->doAsyncWriteOnce(fd, socket, callback, buf);
+        //     });
+        // } else {
+        //     LOG(ERR) << "async write failed";
+        //     if (callback) callback(false);
+        // }
+
+        // TODO: 这个优化目前看起来效果有一点但不大
+        asyncWriteOnceImpl(socket, callback, buf); // 使用拷贝，后面尽可能的 move,
+    }
+
+    void asyncWriteOnceImpl(std::shared_ptr<ISocket> socket, WriteContextCallBack callback,
+                        std::shared_ptr<std::string> buf) {
+
+        struct WriteContext {
+            int fd = -1;
+            EpollContextImpl* impl = nullptr;
+            std::size_t index = -1;
+            std::shared_ptr<ISocket> socket;
+            WriteContextCallBack callback;
+            std::shared_ptr<std::string> buf;
+
+            WriteContext(std::shared_ptr<ISocket>&& socket,
+                WriteContextCallBack&& callback, std::shared_ptr<std::string>&& buf)
+                : socket(std::move(socket)), callback(std::move(callback)), buf(std::move(buf)) {}
+        };
+
         if (int fd = -1; checkSocket(socket, fd)) {
             size_t index = std::hash<int>{}(fd) % loops_.size();
-            loops_[index]->postTask([this, index, fd, socket, callback, buf] {
-                loops_[index]->doAsyncWriteOnce(fd, socket, callback, buf);
+
+            std::shared_ptr<WriteContext> context = std::make_shared<WriteContext>(
+                std::move(socket), std::move(callback), std::move(buf)
+            );
+
+            context->impl = this;
+            context->fd = fd;
+            context->index = index;
+
+            loops_[index]->postTask([context = std::move(context)] {
+                context->impl->loops_[context->index]->doAsyncWriteOnce(context->fd, std::move(context->socket),
+                    std::move(context->callback), std::move(context->buf));
             });
+
         } else {
             LOG(ERR) << "async write failed";
             if (callback) callback(false);
@@ -737,10 +778,10 @@ public:
         }
     }
 
-    void postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) {
+    void postTask(const std::shared_ptr<ISocket>& socket, std::function<void()> function) {
         if (int fd = -1; checkSocket(socket, fd)) {
             size_t index = std::hash<int>{}(fd) % loops_.size();
-            loops_[index]->postTask(function);
+            loops_[index]->postTask(std::move(function));
         }
     }
 };
