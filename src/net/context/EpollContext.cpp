@@ -966,9 +966,10 @@ public:
         return ISocket::ERROR_SOCKET;
     }
 
-    ISocket::SocketHandler addTimer(std::chrono::milliseconds duration, const std::function<void()>& callback) {
-        std::srand(time(nullptr));
-        return addTimer(std::rand(), duration, callback);
+    ISocket::SocketHandler addTimer(std::chrono::milliseconds duration,
+                                              const std::function<void()>& callback) {
+        static std::atomic<int> next_id{0};
+        return addTimer(++next_id, duration, callback);
     }
 
     ISocket::SocketHandler addTimer(int fd, std::chrono::milliseconds duration, const std::function<void()>& callback) {

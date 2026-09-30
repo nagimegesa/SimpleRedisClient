@@ -1,3 +1,6 @@
+#ifndef LOGGER_WRITER_HPP_
+#define LOGGER_WRITER_HPP_
+
 #include <sstream>
 #include <string>
 
@@ -59,3 +62,4 @@ private:
 
 #define LOG(level) Logger::getInstance().log(level, __FILE__, __LINE__)
 
+#endif

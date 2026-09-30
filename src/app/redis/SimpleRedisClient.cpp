@@ -27,7 +27,8 @@ struct RedisConnection {
     std::atomic<bool> highLevel = {false };
 
     RedisConnection() = default;
-    RedisConnection(RedisConnection&& r) noexcept : socket(std::move(r.socket)), promises(std::move(r.promises)) {
+    RedisConnection(RedisConnection&& r) noexcept : socket(std::move(r.socket)), promises(std::move(r.promises)),
+        writing_promises(std::move(r.writing_promises)), writing_cmds(std::move(r.writing_cmds)) {
         highLevel = r.highLevel.load();
     };
 };
