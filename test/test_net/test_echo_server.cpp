@@ -34,12 +34,11 @@ int main() {
                 return 0;
             }
 
-            auto buffer = buf.substr(0, size);
             client->asyncWriteOnce([](bool success) {
                 if (!success) {
                     LOG(ERR) << "writeOnce failed";
                 }
-            }, std::make_shared<std::string>(std::move(buffer)));
+            }, buf.substr(0, size));
             return size;
         });
     });
@@ -52,12 +51,11 @@ int main() {
             break;
         }
 
-        auto write_buf = std::make_shared<std::string>(std::move(input));
         socket->asyncWriteOnce([](bool success) {
             // std::cout << success << std::endl;
             if (!success) {
                 LOG(ERR) << "writeOnce failed";
             }
-        }, write_buf);
+        }, input);
     }
 }

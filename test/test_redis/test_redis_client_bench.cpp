@@ -23,8 +23,7 @@ std::string random_string(size_t len = 8) {
 
 void pipeline_stress_test() {
     SimpleRedisClient client;
-    if (!client.connect("10.0.65.69", 31005)) {
-    // if (!client.connect("127.0.0.1", 6379)) {
+    if (!client.connect("127.0.0.1", 6379)) {
         std::cerr << "Failed to connect to Redis.\n";
         return;
     }
