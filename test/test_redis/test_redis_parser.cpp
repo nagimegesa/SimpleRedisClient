@@ -137,21 +137,21 @@ void test_async_redis_basic() {
     std::string cmd1 = buildRESPCommand({"PING"});
     socket->asyncWriteOnce([](bool ok) {
         if (!ok) std::cerr << "Write failed for PING" << std::endl;
-    }, std::make_shared<std::string>(std::move(cmd1)));
+    }, std::move(cmd1));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     // 发送 SET
     std::string cmd2 = buildRESPCommand({"SET", "testkey", "testvalue"});
     socket->asyncWriteOnce([](bool ok) {
         if (!ok) std::cerr << "Write failed for SET" << std::endl;
-    }, std::make_shared<std::string>(std::move(cmd2)));
+    }, std::move(cmd2));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     // 发送 GET
     std::string cmd3 = buildRESPCommand({"GET", "testkey"});
     socket->asyncWriteOnce([](bool ok) {
         if (!ok) std::cerr << "Write failed for GET" << std::endl;
-    }, std::make_shared<std::string>(std::move(cmd3)));
+    }, std::move(cmd3));
 
     // 等待最多 2 秒
     auto start = std::chrono::steady_clock::now();
