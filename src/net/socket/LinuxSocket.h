@@ -30,6 +30,8 @@ public:
     void asyncWriteBatch(const BatchWriteContextCallback& callback, const std::vector<std::string>& buf) override;
     void asyncWriteBatch(const BatchWriteContextCallback& callback, std::vector<std::string>&& buf) override;
 
+    SocketHandler addTimer(std::chrono::milliseconds ms, std::function<void()> callback) override;
+
     void registerLowLevelCallback(const LowLevelCallback& callback) override;
     void registerHighLevelCallback(const HighLevelCallback& callback) override;
     void registerCloseCallback(const ClosingCallback& callback) override;

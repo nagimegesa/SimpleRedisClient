@@ -30,7 +30,7 @@ void pipeline_stress_test() {
     }
 
     // ===== 可调参数 =====
-    const size_t BATCH_SIZE = 1000;        // 每批发送的命令数（pipeline 深度）
+    const size_t BATCH_SIZE = 5000;        // 每批发送的命令数（pipeline 深度）
     const size_t TOTAL_BATCHES = 1000;      // 总批次数（总命令数 = BATCH_SIZE * TOTAL_BATCHES）
     // ====================
 

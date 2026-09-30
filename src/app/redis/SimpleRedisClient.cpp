@@ -12,10 +12,14 @@
 #include <queue>
 #include <utility>
 
-
 struct RedisConnection {
     std::shared_ptr<ISocket> socket;
     std::queue<std::shared_ptr<std::promise<RESPValue>>> promises;
+
+    std::deque<std::shared_ptr<std::promise<RESPValue>>> writing_promises;
+    std::vector<std::string> writing_cmds;
+
+    bool flush_time = false;
 
     // SpinLock lock; // 自旋锁比 mutex 好一点，但是不多
     // std::mutex lock;
@@ -23,9 +27,7 @@ struct RedisConnection {
     std::atomic<bool> highLevel = {false };
 
     RedisConnection() = default;
-    RedisConnection(RedisConnection&& r) noexcept {
-        socket = std::move(r.socket);
-        promises = std::move(r.promises);
+    RedisConnection(RedisConnection&& r) noexcept : socket(std::move(r.socket)), promises(std::move(r.promises)) {
         highLevel = r.highLevel.load();
     };
 };
@@ -87,8 +89,62 @@ struct SimpleRedisClient::ClientImpl {
         epollContext->close();
     }
 
+    std::shared_ptr<std::promise<RESPValue>> execute1(std::string args) {
+        std::size_t which_sock = std::hash<std::size_t>{}(++SimpleRedisClient::ClientImpl::counter) % clients.size();
+
+        auto p = std::make_shared<std::promise<RESPValue>>();
+        if (clients[which_sock].highLevel) {
+            p->set_exception(std::make_exception_ptr(std::runtime_error("to many bytes to write")));
+            return p;
+        }
+
+        auto& conn = clients[which_sock];
+
+        // 原本就是想省掉这个postTask, 但是又绕回去了，是只是整体更稳定一点
+        conn.socket->getContext()->postTask(conn.socket, [&conn, args = std::move(args), promise = p]() mutable {
+            conn.writing_cmds.emplace_back(std::move(args));
+            conn.writing_promises.emplace_back(std::move(promise));
+
+            auto batch_write_callback = [&conn](bool success, int index) {
+                auto promise = std::move(conn.writing_promises.front());
+                conn.writing_promises.pop_front();
+                if (!success) {
+                    LOG(ERR) << "SimpleRedisClient::execute() failed";
+                    promise->set_exception(std::make_exception_ptr(std::runtime_error("write error")));
+                    return;
+                }
+                conn.promises.push(std::move(promise));
+            };
+
+            auto flush = [&conn, batch_write_callback]() {
+                if (!conn.writing_cmds.empty()) {
+                    std::vector<std::string> cmds;
+                    cmds.swap(conn.writing_cmds);
+                    conn.socket->asyncWriteBatch(batch_write_callback, std::move(cmds));
+                }
+            };
+
+            if (conn.writing_cmds.size() >= WRITE_BATCH_SIZE) {
+                flush();
+            } else if (!conn.flush_time) {
+                ISocket::SocketHandler handler =
+                    conn.socket->addTimer(std::chrono::milliseconds(10),[&conn, flush]() {
+                        flush();
+                        conn.flush_time = false;
+                });
+
+                if (handler != ISocket::ERROR_SOCKET) {
+                    conn.flush_time = true;
+                    flush();
+                }
+            }
+        });
+
+        return p;
+    }
+
     std::shared_ptr<std::promise<RESPValue>> execute(std::string cmd) { // C++ 17 保证传入右值不会拷贝
-        int which_sock = std::hash<std::size_t>{}(++SimpleRedisClient::ClientImpl::counter) % clients.size();
+        std::size_t which_sock = std::hash<std::size_t>{}(++SimpleRedisClient::ClientImpl::counter) % clients.size();
         auto p = std::make_shared<std::promise<RESPValue>>();
         // {
         //     std::lock_guard _(clients[which_sock].lock);

@@ -50,10 +50,17 @@ public:
     void registerLowLevelCallback(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) const;
     void registerCloseCallback(const std::shared_ptr<ISocket>& socket, const ClosingCallback& callback) const;
     void postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const;
-    void addTimer(const std::shared_ptr<ISocket>& socket, const std::chrono::milliseconds& milliseconds, const std::function<void()>&
-                  callback) const;
+    ISocket::SocketHandler addTimer(
+        const std::shared_ptr<ISocket>&  socket,
+        const std::chrono::milliseconds& milliseconds,
+        const std::function<void()>&
+        callback
+    ) const;
 
-    void addTimer(const std::chrono::milliseconds& milliseconds, const std::function<void()>& callback);
+    ISocket::SocketHandler addTimer(
+        const std::chrono::milliseconds& milliseconds,
+        const std::function<void()>&     callback
+    );
 
     void run(bool block=false) const;
     void close() const;

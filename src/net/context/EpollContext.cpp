@@ -146,11 +146,11 @@ public:
         }
     }
 
-    void addTimer(std::chrono::milliseconds ms, std::function<void()> cb) {
+    ISocket::SocketHandler addTimer(std::chrono::milliseconds ms, std::function<void()> cb) {
         int timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
         if (timerfd < 0) {
             LOG(ERR) << "EpollContext::addTimer: timerfd_create failed";
-            return;
+            return ISocket::ERROR_SOCKET;
         }
 
         ::itimerspec spec{};
@@ -164,7 +164,7 @@ public:
         if (timerfd_settime(timerfd, 0, &spec, nullptr) < 0) {
             ::close(timerfd);
             LOG(ERR) << "EpollContext::addTimer: timerfd_settime failed";
-            return;
+            return ISocket::ERROR_SOCKET;;
         }
 
         ::epoll_event ev{};
@@ -177,7 +177,11 @@ public:
             ::close(timerfd);
             timer_fds_.erase(timerfd);
             LOG(ERR) << "EpollContext::addTimer: epoll_ctl failed";
+
+            return ISocket::ERROR_SOCKET;
         }
+
+        return timerfd;
     }
 
 private:
@@ -717,7 +721,7 @@ struct EpollContextImpl {
     static bool checkSocket(const std::shared_ptr<ISocket>& socket, int& fd) {
         if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
             fd = sc->getNative();
-            if (fd == -1) {
+            if (fd == ISocket::ERROR_SOCKET) {
                 LOG(ERR) << "EpollContext: invalid socket fd";
                 return false;
             }
@@ -745,9 +749,9 @@ public:
     }
 
     void registerAccept(const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) {
-        if (int fd = -1; checkSocket(socket, fd)) {
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
             // 根据 fd 哈希选择事件循环线程
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
             // 提交任务到对应线程
             loops_[index]->postTask([this, index, fd, socket, callback] {
                 loops_[index]->doRegisterAccept(fd, socket, callback);
@@ -758,9 +762,9 @@ public:
     }
 
     void registerRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) {
-        if (int fd = -1; checkSocket(socket, fd)) {
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
             // 根据 fd 哈希选择事件循环线程
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
             // 提交任务到对应线程
             loops_[index]->postTask([this, index, fd, socket, callback] {
                 loops_[index]->doRegisterRead(fd, socket, callback);
@@ -795,7 +799,7 @@ public:
                         std::string& buf) {
 
         struct WriteContext {
-            int fd = -1;
+            int fd = ISocket::ERROR_SOCKET;
             EpollContextImpl* impl = nullptr;
             std::size_t index = -1;
             std::shared_ptr<ISocket> socket;
@@ -807,8 +811,8 @@ public:
                 : socket(std::move(socket)), callback(std::move(callback)), buf(std::move(buf)) {}
         };
 
-        if (int fd = -1; checkSocket(socket, fd)) {
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
 
             // 使用 WriteContext 优化 std::function 的堆分配，但是会多一次 shared_ptr, 后面可以改成 unique_ptr
             std::shared_ptr<WriteContext> context = std::make_shared<WriteContext>(
@@ -844,7 +848,7 @@ public:
                          BatchWriteContextCallback callback,
                          std::vector<std::string> bufs) {
         struct WriteContext {
-            int fd = -1;
+            int fd = ISocket::ERROR_SOCKET;
             EpollContextImpl* impl = nullptr;
             std::size_t index = -1;
             std::shared_ptr<ISocket> socket;
@@ -857,8 +861,8 @@ public:
                 : socket(std::move(s)), callback(std::move(cbs)), bufs(std::move(b)) {}
         };
 
-        if (int fd = -1; checkSocket(socket, fd)) {
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
 
             auto context = std::make_shared<WriteContext>(
                 std::move(socket), std::move(callback), std::move(bufs));
@@ -880,8 +884,8 @@ public:
     }
 
     void removeSocket(const std::shared_ptr<ISocket>& socket) {
-        if (int fd = -1; checkSocket(socket, fd)) {
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask([this, index, fd] {
                 loops_[index]->doClose(fd);
             });
@@ -911,8 +915,8 @@ public:
     }
 
     void registerHighLevel(const std::shared_ptr<ISocket>& socket, const HighLevelCallback& callback) {
-        if (int fd = -1; checkSocket(socket, fd)) {
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask([this, index, fd, callback] {
                 loops_[index]->doRegisterHighLevelCallback(fd, callback);
             });
@@ -922,8 +926,8 @@ public:
     }
 
     void registerLowLevel(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) {
-        if (int fd = -1; checkSocket(socket, fd)) {
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask([this, index, fd, callback] {
                loops_[index]->doRegisterLowLevelCallback(fd, callback);
             });
@@ -933,8 +937,8 @@ public:
     }
 
     void registerCloseCallback(const std::shared_ptr<ISocket>& socket, const ClosingCallback& callback) {
-        if (int fd = -1; checkSocket(socket, fd)) {
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask([this, index, fd, callback] {
                 loops_[index]->doRegisterCloseCallback(fd, callback);
             });
@@ -944,30 +948,32 @@ public:
     }
 
     void postTask(const std::shared_ptr<ISocket>& socket, std::function<void()> function) {
-        if (int fd = -1; checkSocket(socket, fd)) {
-            size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask(std::move(function));
         } else {
             LOG(ERR) << "postTask failed";
         }
     }
 
-    void addTimer(const std::shared_ptr<ISocket>& socket, std::chrono::milliseconds duration, const std::function<void()>& callback) {
-        if (int fd = -1; checkSocket(socket, fd)) {
-            addTimer(fd, duration, callback);
+    ISocket::SocketHandler addTimer(const std::shared_ptr<ISocket>& socket, std::chrono::milliseconds duration, const std::function<void()>& callback) {
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            return addTimer(fd, duration, callback);
         } else {
             LOG(ERR) << "addTimer failed";
         }
+
+        return ISocket::ERROR_SOCKET;
     }
 
-    void addTimer(std::chrono::milliseconds duration, const std::function<void()>& callback) {
+    ISocket::SocketHandler addTimer(std::chrono::milliseconds duration, const std::function<void()>& callback) {
         std::srand(time(nullptr));
-        addTimer(std::rand(), duration, callback);
+        return addTimer(std::rand(), duration, callback);
     }
 
-    void addTimer(int fd, std::chrono::milliseconds duration, const std::function<void()>& callback) {
-        int index = std::hash<int>{}(fd) % loops_.size();
-        loops_[index]->addTimer(duration, callback);
+    ISocket::SocketHandler addTimer(int fd, std::chrono::milliseconds duration, const std::function<void()>& callback) {
+        std::size_t index = std::hash<int>{}(fd) % loops_.size();
+        return loops_[index]->addTimer(duration, callback);
     }
 };
 
@@ -1032,16 +1038,19 @@ void EpollContext::postTask(const std::shared_ptr<ISocket>& socket, const std::f
     impl->postTask(socket, function);
 }
 
-void EpollContext::addTimer(
-    const std::shared_ptr<ISocket>& socket,
+ISocket::SocketHandler EpollContext::addTimer(
+    const std::shared_ptr<ISocket>&  socket,
     const std::chrono::milliseconds& milliseconds,
-    const std::function<void()>& callback
+    const std::function<void()>&     callback
 ) const {
-    impl->addTimer(socket, milliseconds, callback);
+    return impl->addTimer(socket, milliseconds, callback);
 }
 
-void EpollContext::addTimer(const std::chrono::milliseconds& milliseconds, const std::function<void()>& callback) {
-    impl->addTimer(milliseconds, callback);
+ISocket::SocketHandler EpollContext::addTimer(
+    const std::chrono::milliseconds& milliseconds,
+    const std::function<void()>&     callback
+) {
+    return impl->addTimer(milliseconds, callback);
 }
 
 void EpollContext::run(bool block) const {

@@ -171,6 +171,15 @@ void LinuxSocket::asyncWriteBatch(const BatchWriteContextCallback& callback, std
     } else {
         LOG(ERR) << "LinuxSocket::asyncWriteOnce: epollContext is nullptr";
     }
+}
+
+ISocket::SocketHandler LinuxSocket::addTimer(std::chrono::milliseconds ms, std::function<void()> callback) {
+    if (auto context = epollContext_.lock()) {
+        return context->addTimer(shared_from_this(), ms, callback);
+    } else {
+        LOG(ERR) << "LinuxSocket::addTimer: epollContext is nullptr";
+    }
+    return ISocket::ERROR_SOCKET;
 };
 
 void LinuxSocket::registerLowLevelCallback(const LowLevelCallback& callback) {

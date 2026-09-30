@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <functional>
+#include <chrono>
 
 class SocketManager;
 class EpollContext;
@@ -51,6 +52,8 @@ public:
     virtual void  asyncWriteOnce(const WriteContextCallBack& callback, std::string buf) = 0;
     virtual void  asyncWriteBatch(const BatchWriteContextCallback& callback, const std::vector<std::string>& buf) = 0;
     virtual void  asyncWriteBatch(const BatchWriteContextCallback& callback, std::vector<std::string>&& buf) = 0;
+
+    virtual SocketHandler addTimer(std::chrono::milliseconds ms, std::function<void()> callback) = 0;
 
     virtual SocketHandler getNative() const = 0;
 
