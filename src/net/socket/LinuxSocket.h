@@ -19,23 +19,23 @@ public:
     bool                     bind(const std::string& ip, unsigned short port) override;
     bool                     listen(int backlog) override;
     std::shared_ptr<ISocket> accept() override;
-    int                      read(char* msg, int len) override;
-    int                      write(const char* msg, int len) override;
-    bool                     connect(const char* ip, unsigned short port) override;
-    void                     close() override;
-    void                     asyncAccept(const AcceptContextCallback& callback) override;
-    void                     asyncRead(const ReadContextCallBack& call_back) override;
-    void                     asyncWriteOnce(
-        const WriteContextCallBack&         callback,
-        const std::shared_ptr<std::string>& buf
-    ) override;
+
+    int  read(char* msg, int len) override;
+    int  write(const char* msg, int len) override;
+    bool connect(const char* ip, unsigned short port) override;
+    void close() override;
+    void asyncAccept(const AcceptContextCallback& callback) override;
+    void asyncRead(const ReadContextCallBack& call_back) override;
+    void asyncWriteOnce(const WriteContextCallBack& callback, std::string buf) override;
+    void asyncWriteBatch(const BatchWriteContextCallback& callback, const std::vector<std::string>& buf) override;
+    void asyncWriteBatch(const BatchWriteContextCallback& callback, std::vector<std::string>&& buf) override;
 
     void registerLowLevelCallback(const LowLevelCallback& callback) override;
     void registerHighLevelCallback(const HighLevelCallback& callback) override;
     void registerCloseCallback(const ClosingCallback& callback) override;
 
     void setNoBlock() override;
-    int getNative() const;
+    int getNative() const override;
 };
 
 

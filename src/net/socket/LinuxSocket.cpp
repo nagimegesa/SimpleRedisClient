@@ -149,13 +149,29 @@ void LinuxSocket::asyncRead(const ReadContextCallBack& call_back) {
 }
 
 void LinuxSocket::asyncWriteOnce(
-    const WriteContextCallBack& callback, const std::shared_ptr<std::string>& buf) {
+    const WriteContextCallBack& callback, std::string buf) {
     if (auto context = epollContext_.lock()) {
         context->asyncWriteOnce(shared_from_this(), callback, buf);
     } else {
         LOG(ERR) << "LinuxSocket::asyncWriteOnce: epollContext is nullptr";
     }
 }
+
+void LinuxSocket::asyncWriteBatch(const BatchWriteContextCallback& callback, const std::vector<std::string>& buf) {
+    if (auto context = epollContext_.lock()) {
+        context->asyncWriteBatch(shared_from_this(), callback, buf);
+    } else {
+        LOG(ERR) << "LinuxSocket::asyncWriteOnce: epollContext is nullptr";
+    }
+};
+
+void LinuxSocket::asyncWriteBatch(const BatchWriteContextCallback& callback, std::vector<std::string>&& buf) {
+    if (auto context = epollContext_.lock()) {
+        context->asyncWriteBatch(shared_from_this(), callback, std::move(buf));
+    } else {
+        LOG(ERR) << "LinuxSocket::asyncWriteOnce: epollContext is nullptr";
+    }
+};
 
 void LinuxSocket::registerLowLevelCallback(const LowLevelCallback& callback) {
     if (auto context = epollContext_.lock()) {

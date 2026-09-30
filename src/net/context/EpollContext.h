@@ -4,6 +4,7 @@
 
 #ifndef DEMO_EPOLLSERVER_H
 #define DEMO_EPOLLSERVER_H
+#include <chrono>
 #include <memory>
 
 
@@ -28,12 +29,32 @@ public:
 
     void registerAsyncAccept(const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) const;
     void registerAsyncRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) const;
-    void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback, const std::shared_ptr<std::string>& buf) const;
+    void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback, std::string& buf) const;
+    void asyncWriteOnce(
+        const std::shared_ptr<ISocket>& socket,
+        const WriteContextCallBack&     callback,
+        std::string&&                   buf
+    ) const;
+    void asyncWriteBatch(
+        const std::shared_ptr<ISocket>& socket,
+        const BatchWriteContextCallback&     callback,
+        const std::vector<std::string>&      buf
+    ) const;
+    void asyncWriteBatch(
+        const std::shared_ptr<ISocket>&  socket,
+        const BatchWriteContextCallback& callback,
+        std::vector<std::string>&&       buf
+    ) const;
     void removeSocket(const std::shared_ptr<ISocket>& socket) const;
     void registerHighLevelCallback(const std::shared_ptr<ISocket>& socket, const HighLevelCallback& callback) const;
     void registerLowLevelCallback(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) const;
     void registerCloseCallback(const std::shared_ptr<ISocket>& socket, const ClosingCallback& callback) const;
     void postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const;
+    void addTimer(const std::shared_ptr<ISocket>& socket, const std::chrono::milliseconds& milliseconds, const std::function<void()>&
+                  callback) const;
+
+    void addTimer(const std::chrono::milliseconds& milliseconds, const std::function<void()>& callback);
+
     void run(bool block=false) const;
     void close() const;
 

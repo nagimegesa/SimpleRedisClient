@@ -14,7 +14,7 @@ public:
     void write(std::string&& str) {
         // queue.enqueue(std::move(str));
         // 不断写直到成功
-        while (!queue.push(std::move(str))) {}
+        // while (!queue.push(std::move(str))) {}
     }
 
     void set_log_file(const char* file, bool create) {
@@ -49,7 +49,7 @@ public:
 
 private:
     LoggerWriter() {
-        writer_thread = std::thread(&LoggerWriter::write_log, this);
+        // writer_thread = std::thread(&LoggerWriter::write_log, this);
     };
 
     void write_log() {

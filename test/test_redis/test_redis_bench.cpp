@@ -108,8 +108,7 @@ int main(int argc, char* argv[]) {
                                 LOG(INFO) << "Write success: " << write_success.load() << "\n";
                             }
                         }
-                    },
-                    std::make_shared<std::string>(std::move(cmd)));
+                    }, std::move(cmd));
             }
 
             // 等待本线程所有响应收完

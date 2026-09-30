@@ -12,9 +12,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <random>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/uio.h>
 
 #include "logger/Logger.h"
@@ -24,13 +26,13 @@
 // 写元信息
 struct WriteMetaInfo {
     // std::shared_ptr<ISocket> socket;
-    std::shared_ptr<std::string> buffer;
+    std::string buffer;
     size_t offset = 0;
     WriteContextCallBack callback;
 
     // WriteMetaInfo(std::shared_ptr<ISocket> s, WriteContextCallBack cb, std::shared_ptr<std::string> buf)
     //     : socket(std::move(s)), buffer(std::move(buf)), callback(std::move(cb)) {}
-    WriteMetaInfo(WriteContextCallBack&& cb, std::shared_ptr<std::string>&& buf) : buffer(std::move(buf)), callback(std::move(cb)) {}
+    WriteMetaInfo(WriteContextCallBack&& cb, std::string&& buf) : buffer(std::move(buf)), callback(std::move(cb)) {}
 };
 
 // ------------------------- 内部结构定义 -------------------------
@@ -133,6 +135,51 @@ public:
         }
     }
 
+    void postTaskBatch(std::vector<std::function<void()>>&& task_batch) {
+        for (auto& t : task_batch) {
+            while (!task_queue_.push(std::move(t))) {} // push 可能返回 False 需要不断尝试
+        }
+
+        if (!awake.exchange(true, std::memory_order_release)) { // 如果 exchange 返回 false, 之前就是 false
+            uint64_t one = 1;
+            ::write(wakeup_fd_, &one, sizeof(one));
+        }
+    }
+
+    void addTimer(std::chrono::milliseconds ms, std::function<void()> cb) {
+        int timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        if (timerfd < 0) {
+            LOG(ERR) << "EpollContext::addTimer: timerfd_create failed";
+            return;
+        }
+
+        ::itimerspec spec{};
+
+        auto sec = std::chrono::duration_cast<std::chrono::seconds>(ms);
+        auto ns = std::chrono::nanoseconds(ms - sec);
+
+        spec.it_value.tv_sec = sec.count();
+        spec.it_value.tv_nsec = ns.count();
+
+        if (timerfd_settime(timerfd, 0, &spec, nullptr) < 0) {
+            ::close(timerfd);
+            LOG(ERR) << "EpollContext::addTimer: timerfd_settime failed";
+            return;
+        }
+
+        ::epoll_event ev{};
+        ev.data.fd = timerfd;
+        ev.events = EPOLLIN | EPOLLONESHOT;
+
+        timer_fds_.emplace(timerfd, std::move(cb));
+
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, timerfd, &ev) < 0) {
+            ::close(timerfd);
+            timer_fds_.erase(timerfd);
+            LOG(ERR) << "EpollContext::addTimer: epoll_ctl failed";
+        }
+    }
+
 private:
     void run() {
         epoll_event events[MAX_EVENTS];
@@ -214,10 +261,24 @@ private:
         LOG(DEBUG) << "Accept a new socket";
     }
 
+    void handleTimer(int fd) {
+        auto& callback = timer_fds_.find(fd)->second;
+        if (callback) {
+            callback();
+        }
+        close(fd);
+        timer_fds_.erase(fd); // timer_fd 设置了 oneshot epoll 会自动移除
+    }
+
     void handleRead(int fd) {
 
         if (accept_socket_set_.contains(fd)) { // server 读事件
             handleAccept(fd);
+            return;
+        }
+
+        if (timer_fds_.contains(fd)) {
+            handleTimer(fd);
             return;
         }
 
@@ -327,8 +388,8 @@ private:
         for (int i = 0; i < write_count; ++i) {
             ::iovec iov{};
             auto& data = conn->write_queue[i];
-            iov.iov_base = data.buffer->data() + data.offset;
-            iov.iov_len = data.buffer->size() - data.offset;
+            iov.iov_base = data.buffer.data() + data.offset;
+            iov.iov_len = data.buffer.size() - data.offset;
             if (iov.iov_len > 0) {
                 iovs.emplace_back(iov);
             }
@@ -363,7 +424,7 @@ private:
 
         while (!conn->write_queue.empty() && remaining > 0) {
             auto& meta = conn->write_queue.front();
-            size_t unSent = meta.buffer->size() - meta.offset;
+            size_t unSent = meta.buffer.size() - meta.offset;
             if (remaining >= unSent) {
                 remaining -= unSent;
                 if (meta.callback) meta.callback(true);
@@ -503,7 +564,7 @@ public:
     }
 
     void doAsyncWriteOnce(int fd, std::shared_ptr<ISocket>&& socket,
-                          WriteContextCallBack&& callback, std::shared_ptr<std::string>&& buf) {
+                          WriteContextCallBack&& callback, std::string&& buf) {
         // 如果连接不存在，则创建一个只写连接
         auto it = connections_.find(fd);
         if (it == connections_.end()) {
@@ -522,7 +583,7 @@ public:
         // 这里可以使用 & 是因为 不可能出现 conn 被移除的情况
         // 因为 removeSocket 不可能在这个函数内被调用
         auto& conn = it->second;
-        int size = static_cast<int>(buf->size());
+        int size = static_cast<int>(buf.size());
         // conn->write_queue.emplace_back(socket, callback, buf);
         conn->write_queue.emplace_back(std::move(callback), std::move(buf));
         // 高水位背压
@@ -535,6 +596,48 @@ public:
         }
 
         // 如果尚未注册写事件，则修改 epoll
+        if (!conn->write_registered) {
+            conn->write_registered = true;
+            if (conn->read_registered) {
+                modifyEpollEvents(fd, EPOLLIN | EPOLLOUT);
+            } else {
+                modifyEpollEvents(fd, EPOLLOUT);
+            }
+        }
+    }
+
+    void doAsyncWriteBatch(int fd, std::shared_ptr<ISocket>&& socket,
+                       BatchWriteContextCallback&& callbacks,
+                       std::vector<std::string>&& bufs) {
+
+        auto it = connections_.find(fd);
+        if (it == connections_.end()) {
+            auto conn = std::make_shared<Connection>(std::move(socket), nullptr);
+            conn->write_registered = true;
+            connections_[fd] = conn;
+
+            epoll_event ev{};
+            ev.events = EPOLLOUT;
+            ev.data.fd = fd;
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
+
+            it = connections_.find(fd);
+        }
+
+        auto& conn = it->second;
+
+        for (int i = 0; i < bufs.size(); ++i) {
+            conn->in_queue_write_buffer_byte_size += static_cast<int>(bufs[i].size());
+            conn->write_queue.emplace_back([i, callbacks](bool r) { callbacks(r, i); }, std::move(bufs[i]));
+        }
+
+        if (conn->in_queue_write_buffer_byte_size > ISocket::DEFAULT_HIGH_LEVEL_SIZE) {
+            if (conn->high_level_callback && !conn->high_level_callback_set) {
+                conn->high_level_callback_set = true;
+                conn->high_level_callback(conn->socket);
+            }
+        }
+
         if (!conn->write_registered) {
             conn->write_registered = true;
             if (conn->read_registered) {
@@ -595,9 +698,10 @@ private:
 
     std::unordered_map<int, std::shared_ptr<Connection>> connections_; // 仅在事件循环线程访问
     std::unordered_map<int, std::shared_ptr<AcceptContext>> accept_socket_set_;
+    std::unordered_map<int, std::function<void(void)>> timer_fds_;
     // std::queue<std::function<void()>> task_queue_;                     // 待处理任务队列
     // std::mutex task_mutex_;                                            // 保护任务队列
-    MPSCQueue<std::function<void()>, 4096> task_queue_;
+    MPSCQueue<std::function<void()>, 512> task_queue_;
 
 
     constexpr static int MAX_EVENTS = 2048;
@@ -667,7 +771,12 @@ public:
     }
 
     void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback,
-                        const std::shared_ptr<std::string>& buf) {
+                        std::string&& buf) {
+        asyncWriteOnceImpl(socket, callback, buf);
+    }
+
+    void asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback,
+                        std::string& buf) {
         // if (int fd = -1; checkSocket(socket, fd)) {
         //     size_t index = std::hash<int>{}(fd) % loops_.size();
         //     loops_[index]->postTask([this, index, fd, socket, callback, buf] {
@@ -678,12 +787,12 @@ public:
         //     if (callback) callback(false);
         // }
 
-        // TODO: 这个优化目前看起来效果有一点但不大
-        asyncWriteOnceImpl(socket, callback, buf); // 使用拷贝，后面尽可能的 move,
+        // 使用拷贝，后面尽可能的 move, 这里的buf 在最上层已经拷贝了一次，可以安全移动
+        asyncWriteOnceImpl(socket, callback, buf);
     }
 
     void asyncWriteOnceImpl(std::shared_ptr<ISocket> socket, WriteContextCallBack callback,
-                        std::shared_ptr<std::string> buf) {
+                        std::string& buf) {
 
         struct WriteContext {
             int fd = -1;
@@ -691,16 +800,17 @@ public:
             std::size_t index = -1;
             std::shared_ptr<ISocket> socket;
             WriteContextCallBack callback;
-            std::shared_ptr<std::string> buf;
+            std::string buf;
 
             WriteContext(std::shared_ptr<ISocket>&& socket,
-                WriteContextCallBack&& callback, std::shared_ptr<std::string>&& buf)
+                WriteContextCallBack&& callback, std::string&& buf)
                 : socket(std::move(socket)), callback(std::move(callback)), buf(std::move(buf)) {}
         };
 
         if (int fd = -1; checkSocket(socket, fd)) {
             size_t index = std::hash<int>{}(fd) % loops_.size();
 
+            // 使用 WriteContext 优化 std::function 的堆分配，但是会多一次 shared_ptr, 后面可以改成 unique_ptr
             std::shared_ptr<WriteContext> context = std::make_shared<WriteContext>(
                 std::move(socket), std::move(callback), std::move(buf)
             );
@@ -717,6 +827,55 @@ public:
         } else {
             LOG(ERR) << "async write failed";
             if (callback) callback(false);
+        }
+    }
+
+    void asyncWriteBatch(const std::shared_ptr<ISocket>& socket,
+            const BatchWriteContextCallback& callback, const std::vector<std::string>& buf) {
+        asyncWriteBatchImpl(socket, callback, buf);
+    }
+
+    void asyncWriteBatch(const std::shared_ptr<ISocket>& socket,
+        const BatchWriteContextCallback& callback, std::vector<std::string>&& buf) {
+        asyncWriteBatchImpl(socket, callback, std::move(buf));
+    }
+
+    void asyncWriteBatchImpl(std::shared_ptr<ISocket> socket,
+                         BatchWriteContextCallback callback,
+                         std::vector<std::string> bufs) {
+        struct WriteContext {
+            int fd = -1;
+            EpollContextImpl* impl = nullptr;
+            std::size_t index = -1;
+            std::shared_ptr<ISocket> socket;
+            BatchWriteContextCallback callback;
+            std::vector<std::string> bufs;
+
+            WriteContext(std::shared_ptr<ISocket>&& s,
+                         BatchWriteContextCallback&& cbs,
+                         std::vector<std::string>&& b)
+                : socket(std::move(s)), callback(std::move(cbs)), bufs(std::move(b)) {}
+        };
+
+        if (int fd = -1; checkSocket(socket, fd)) {
+            size_t index = std::hash<int>{}(fd) % loops_.size();
+
+            auto context = std::make_shared<WriteContext>(
+                std::move(socket), std::move(callback), std::move(bufs));
+            context->impl  = this;
+            context->fd    = fd;
+            context->index = index;
+
+            loops_[index]->postTask([context = std::move(context)] {
+                context->impl->loops_[context->index]->doAsyncWriteBatch(
+                    context->fd,
+                    std::move(context->socket),
+                    std::move(context->callback),
+                    std::move(context->bufs));
+            });
+        } else {
+            LOG(ERR) << "asyncWriteBatch failed";
+            if (callback) callback(false, -1); // -1 表示全部失败
         }
     }
 
@@ -757,6 +916,8 @@ public:
             loops_[index]->postTask([this, index, fd, callback] {
                 loops_[index]->doRegisterHighLevelCallback(fd, callback);
             });
+        } else {
+            LOG(ERR) << "registerHighLevel failed";
         }
     }
 
@@ -766,6 +927,8 @@ public:
             loops_[index]->postTask([this, index, fd, callback] {
                loops_[index]->doRegisterLowLevelCallback(fd, callback);
             });
+        } else {
+            LOG(ERR) << "registerLowLevel failed";
         }
     }
 
@@ -775,6 +938,8 @@ public:
             loops_[index]->postTask([this, index, fd, callback] {
                 loops_[index]->doRegisterCloseCallback(fd, callback);
             });
+        } else {
+            LOG(ERR) << "registerCloseCallback failed";
         }
     }
 
@@ -782,7 +947,27 @@ public:
         if (int fd = -1; checkSocket(socket, fd)) {
             size_t index = std::hash<int>{}(fd) % loops_.size();
             loops_[index]->postTask(std::move(function));
+        } else {
+            LOG(ERR) << "postTask failed";
         }
+    }
+
+    void addTimer(const std::shared_ptr<ISocket>& socket, std::chrono::milliseconds duration, const std::function<void()>& callback) {
+        if (int fd = -1; checkSocket(socket, fd)) {
+            addTimer(fd, duration, callback);
+        } else {
+            LOG(ERR) << "addTimer failed";
+        }
+    }
+
+    void addTimer(std::chrono::milliseconds duration, const std::function<void()>& callback) {
+        std::srand(time(nullptr));
+        addTimer(std::rand(), duration, callback);
+    }
+
+    void addTimer(int fd, std::chrono::milliseconds duration, const std::function<void()>& callback) {
+        int index = std::hash<int>{}(fd) % loops_.size();
+        loops_[index]->addTimer(duration, callback);
     }
 };
 
@@ -799,8 +984,23 @@ void EpollContext::registerAsyncRead(const std::shared_ptr<ISocket>& socket, con
 }
 
 void EpollContext::asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback,
-                                  const std::shared_ptr<std::string>& buf) const {
+                                  std::string& buf) const {
     impl->asyncWriteOnce(socket, callback, buf);
+}
+
+void EpollContext::asyncWriteOnce(const std::shared_ptr<ISocket>& socket, const WriteContextCallBack& callback,
+                                  std::string&& buf) const {
+    impl->asyncWriteOnce(socket, callback, std::move(buf));
+}
+
+void EpollContext::asyncWriteBatch(const std::shared_ptr<ISocket>& socket, const BatchWriteContextCallback& callback,
+                                  const std::vector<std::string>& buf) const {
+    impl->asyncWriteBatch(socket, callback, buf);
+}
+
+void EpollContext::asyncWriteBatch(const std::shared_ptr<ISocket>& socket, const BatchWriteContextCallback& callback,
+                                  std::vector<std::string>&& buf) const {
+    impl->asyncWriteBatch(socket, callback, std::move(buf));
 }
 
 void EpollContext::removeSocket(const std::shared_ptr<ISocket>& socket) const {
@@ -830,6 +1030,18 @@ void EpollContext::registerCloseCallback(
 
 void EpollContext::postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const {
     impl->postTask(socket, function);
+}
+
+void EpollContext::addTimer(
+    const std::shared_ptr<ISocket>& socket,
+    const std::chrono::milliseconds& milliseconds,
+    const std::function<void()>& callback
+) const {
+    impl->addTimer(socket, milliseconds, callback);
+}
+
+void EpollContext::addTimer(const std::chrono::milliseconds& milliseconds, const std::function<void()>& callback) {
+    impl->addTimer(milliseconds, callback);
 }
 
 void EpollContext::run(bool block) const {

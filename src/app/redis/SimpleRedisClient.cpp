@@ -10,6 +10,7 @@
 #include "thread_pool/lock/SpinLock.h"
 
 #include <queue>
+#include <utility>
 
 
 struct RedisConnection {
@@ -33,6 +34,8 @@ struct SimpleRedisClient::ClientImpl {
     std::shared_ptr<EpollContext> epollContext;
     std::vector<RedisConnection> clients;
     static thread_local std::size_t counter;
+
+    constexpr static size_t WRITE_BATCH_SIZE = 1000;
 
     ClientImpl() {
         epollContext = std::make_shared<EpollContext>();
@@ -84,7 +87,7 @@ struct SimpleRedisClient::ClientImpl {
         epollContext->close();
     }
 
-    std::shared_ptr<std::promise<RESPValue>> execute(std::string cmd) {
+    std::shared_ptr<std::promise<RESPValue>> execute(std::string cmd) { // C++ 17 保证传入右值不会拷贝
         int which_sock = std::hash<std::size_t>{}(++SimpleRedisClient::ClientImpl::counter) % clients.size();
         auto p = std::make_shared<std::promise<RESPValue>>();
         // {
@@ -117,7 +120,7 @@ struct SimpleRedisClient::ClientImpl {
                     clients[which_sock].promises.push(p);
                 }
             },
-            std::make_shared<std::string>(std::move(cmd)));
+            std::move(cmd));
 
         return p;
     }

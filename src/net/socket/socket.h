@@ -17,6 +17,7 @@ using HighLevelCallback = std::function<void(const std::shared_ptr<ISocket>& cli
 using LowLevelCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
 using ClosingCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
 using WriteContextCallBack = std::function<void(bool)>;
+using BatchWriteContextCallback = std::function<void(bool, int)>;
 
 class ISocket : public std::enable_shared_from_this<ISocket> {
 
@@ -39,17 +40,17 @@ public:
     virtual bool                     bind(const std::string& ip, unsigned short port) = 0;
     virtual bool                     listen(int backlog) = 0;
     virtual std::shared_ptr<ISocket> accept() = 0;
-    virtual int                      read(char* msg, int len) = 0;
-    virtual int                      write(const char* msg, int len) = 0;
-    virtual bool                     connect(const char* ip, unsigned short port) = 0;
-    virtual void                     close() = 0;
-    virtual void                     setNoBlock() = 0;
-    virtual void                     asyncAccept(const AcceptContextCallback& callback) = 0;
-    virtual void                     asyncRead(const ReadContextCallBack& callback) = 0;
-    virtual void                     asyncWriteOnce(
-        const WriteContextCallBack&         callback,
-        const std::shared_ptr<std::string>& buf
-    ) = 0;
+
+    virtual int   read(char* msg, int len) = 0;
+    virtual int   write(const char* msg, int len) = 0;
+    virtual bool  connect(const char* ip, unsigned short port) = 0;
+    virtual void  close() = 0;
+    virtual void  setNoBlock() = 0;
+    virtual void  asyncAccept(const AcceptContextCallback& callback) = 0;
+    virtual void  asyncRead(const ReadContextCallBack& callback) = 0;
+    virtual void  asyncWriteOnce(const WriteContextCallBack& callback, std::string buf) = 0;
+    virtual void  asyncWriteBatch(const BatchWriteContextCallback& callback, const std::vector<std::string>& buf) = 0;
+    virtual void  asyncWriteBatch(const BatchWriteContextCallback& callback, std::vector<std::string>&& buf) = 0;
 
     virtual SocketHandler getNative() const = 0;
 

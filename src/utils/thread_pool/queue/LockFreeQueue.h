@@ -77,9 +77,11 @@ public:
         //     except = tail;
         // }
 
-        if (data[tail].seq.load(std::memory_order_acquire) == INVALID_INDEX) {
-            return false;
-        }
+        // if (data[tail].seq.load(std::memory_order_acquire) == INVALID_INDEX) {
+        //     return false;
+        // }
+
+        while (data[tail].seq.load(std::memory_order_acquire) == INVALID_INDEX) {}
 
         item = std::move(data[tail].item);
         std::size_t tail_next = (tail + 1) % Cap;

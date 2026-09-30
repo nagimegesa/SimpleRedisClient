@@ -554,7 +554,7 @@ public:
 
         client->asyncWriteOnce(
             [](bool success) {},
-            std::make_shared<std::string>(std::move(response))
+            std::move(response)
         );
     }
 
