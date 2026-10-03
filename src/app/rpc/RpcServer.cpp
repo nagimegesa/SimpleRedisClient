@@ -1,17 +1,17 @@
 //
 // Created by computer on 2026/9/15.
 //
-#include <string>
 
 #include "RpcServer.h"
-
+#include <string>
+#include <future>
+#include "corou/Generator.h"
 #include "thread_pool/thread_pool.h"
 #include "context/EpollContext.h"
 #include "logger/Logger.h"
 #include "socket/SocketManager.h"
 #include "Nacos.h"
-
-using RpcHandler = std::function<std::string(std::string)>;
+#include "corou/Waiter.h"
 
 /*
  * 0x0a 0x0b    // 2
@@ -26,6 +26,9 @@ using RpcHandler = std::function<std::string(std::string)>;
  * serialize parma for parma_len // 18 + service_len + func_len + parma_len
  * 0x0b 0x0c // 20 + service_len + func_len + parma_len
  */
+
+
+/* region 解析协议 */
 
 enum ParserStatus {
     SOA, SOB,
@@ -163,6 +166,11 @@ std::string buildResponse(const std::string& body, std::uint64_t request_id) {
     append_magic_end(res);
 
     return res;
+}
+
+std::string buildStreamResponse(const std::string& body, std::uint64_t request_id) {
+    // TODO: 实习这个函数，这里暂时使用 buildResponse替代
+    return buildResponse(body, request_id);
 }
 
 inline void parse(
@@ -451,12 +459,105 @@ inline void parse(
     set_waiting();
 }
 
+/* endregion */
+
+struct Channel {
+    std::coroutine_handle<> waiter = nullptr;
+    std::deque<std::string> buffer;
+    bool closed_ = false;
+
+    struct ChannelWaiter {
+        Channel& channel;
+
+        bool await_ready() const noexcept { return channel.closed_  || !channel.buffer.empty(); }
+        bool await_suspend(std::coroutine_handle<> handle) const noexcept {
+            channel.waiter = handle;
+        }
+        void await_resume() const noexcept { }
+    };
+
+    void push(std::string string) {
+        buffer.push_back(std::move(string));
+        if (waiter) { // 这里这样写是为了防止 在写错调用期间 waiter 被覆盖，或者销毁（其实这里还没太搞懂, deepseek 教的）
+            auto h = waiter;
+            waiter = nullptr;
+            h.resume();
+        }
+    }
+
+    ChannelWaiter wait() {
+        return ChannelWaiter{*this};
+    }
+
+    Task<std::optional<std::string>> next() {
+        while (buffer.empty() && !closed_) {
+            co_await wait();
+        }
+
+        if (buffer.empty()) {
+            co_return std::nullopt;
+        }
+
+        auto t = std::move(buffer.front());
+        buffer.pop_front();
+        co_return std::move(t);
+    }
+
+    void close() {
+        closed_ = true;
+        if (waiter) {
+            auto h = waiter;
+            waiter = nullptr;
+            h.resume(); // close 的时候需要让 next 知道，然后返回 nullopt
+        }
+    }
+};
+
+struct RpcSession {
+    std::shared_ptr<ISocket> socket;
+    Channel channel;
+    std::shared_ptr<RpcContext> context;
+};
+
+using RpcHandler = std::function<std::string(std::string)>;
+using RpcStreamHandler = std::function<AsyncGenerator<std::string>(AsyncGenerator<std::string> bufferStream)>;
+
+struct RpcServer::RpcWriter::Impl {
+
+    std::uint64_t request_id = 0;
+    std::shared_ptr<ISocket> socket = nullptr;
+
+    bool write(const ::google::protobuf::Message& message) const {
+        std::string out;
+        if (message.SerializeToString(&out)) {
+            out = buildErrorResponse(request_id, ERR_UNKNOWN_RESPONSE);
+        }
+
+        if (socket) {
+            std::promise<bool> promise;
+            socket->asyncWriteOnce([&promise](bool success) {
+                promise.set_value(success);
+            }, buildStreamResponse(out, request_id));
+
+            return promise.get_future().get();
+        }
+
+        return false;
+    }
+};
+
+bool RpcServer::RpcWriter::write(::google::protobuf::Message& message) const {
+    return impl->write(message);
+}
+
+RpcServer::RpcWriter::RpcWriter() : impl(std::make_unique<Impl>()) {}
+
 struct RpcServer::RpcServerImpl {
 private:
 
     struct PairStringHash {
         std::size_t operator()(const std::pair<std::string, std::string>& p) const {
-            std::hash<std::string> hasher;
+            const std::hash<std::string> hasher;
             return hasher(p.first) ^ hasher(p.second);
         }
     };
@@ -464,6 +565,7 @@ private:
     std::shared_ptr<EpollContext> context_;
     std::set<std::unique_ptr<RpcServiceBase>> services_; // 保留Service防止被析构
     std::unordered_map<std::pair<std::string, std::string>, RpcHandler, PairStringHash> handlers_;
+    std::unordered_map<std::pair<std::string, std::string>, RpcStreamHandler, PairStringHash> streamHandlers_;
     std::shared_ptr<ISocket> socket_;
     ThreadPool threadPool_;
     std::unique_ptr<nacos::NamingService> namingService_;
@@ -487,76 +589,176 @@ public:
         });
     }
 
-    void acceptClient(const std::shared_ptr<ISocket>& client) {
+    Task<void> acceptClient(const std::shared_ptr<ISocket>& client) {
         LOG(DEBUG) << "RpcServer:: accept a new client";
 
         auto context = std::make_shared<RpcContext>(); // 这个 context 会保存到 close
-        client->asyncRead([this, client, context](const std::string& buffer, std::size_t size) {
+
+        auto session = std::make_shared<RpcSession>();
+        session->socket = client;
+        session->context = context;
+        session->channel = Channel{};
+
+        client->getContext()->postTask(client, [this, session]() {
+            dispatch(session);
+        });
+
+        // session 会跟着 socket 销毁
+        client->asyncRead([client, session](const std::string& buffer, std::size_t size) {
             LOG(DEBUG) << "RpcServer: read " << " size " << size << " fd " << client->getNative();
             if (size == 0) {
                 client->close();
                 return size;
             }
 
-            std::size_t offset = 0;
-            while (offset < size) {
-                std::size_t parsed = 0;
-                parse(buffer, offset, size, parsed, *context);
-                offset += parsed;
-                if (context->result == COMPLETE || context->result == ERROR) {
-                    RpcContext local = std::move(*context);
-                    *context = RpcContext{};
-                    // 扔给线程池避免阻塞 epoll 线程
-                    threadPool_.put([](const Result&) {},
-                        &RpcServerImpl::dispatch, this, std::move(local), client);
-                    continue;
-                }
-
-                if (context->result == WAITING) {
-                    return offset;
-                }
-
-                // 不可能执行到这里
-                assert(false);
-            }
-            return offset;
+            session->channel.push(buffer);
+            return size;
         });
 
         client->registerCloseCallback([](const std::shared_ptr<ISocket>& client) {
             LOG(DEBUG) << "RpcServer: close " << client->getNative();
         });
+
+        co_return;
     }
 
-    void dispatch(RpcContext&& context, const std::shared_ptr<ISocket>& client) {
+    /**
+     * TODO: 这个 dispatch 因为还没有修改二进制协议，同时 一个 session 只能支持一个流，后面改了协议可以解决这个问题
+     * @param session
+     * @return
+     */
+    Task<void> dispatch(std::shared_ptr<RpcSession> session) {
+        std::string buffer;
+        while (auto t_buffer = co_await session->channel.next()) {
+            buffer.append(*t_buffer);
+            auto& session_context = session->context;
+            std::size_t offset = 0;
+            while (offset < buffer.size()) {
+                std::size_t parsed = 0;
+                parse(buffer, offset, buffer.size(), parsed, *session_context);
+                offset += parsed;
+                if (session_context->result == COMPLETE) {
 
-        assert(context.result != WAITING);
-        std::string response;
+                    RpcContext context(std::move(*session_context));
+                    *session_context = RpcContext{}; // 清空掉原来的 context
 
-        if (context.result == ERROR) {
-            response = buildErrorResponse(context.request_id, ERR_BAD_REQUEST);
-        } else if (context.result == COMPLETE) {
-            if (handlers_.contains(std::pair{context.service_name, context.func_name})) {
-                LOG(DEBUG) << "Rpc server: dispatch function " << context.func_name;
-                try {
-                    std::string res = handlers_[std::pair{context.service_name, context.func_name}](std::move(context.params));
-                    response = buildResponse(res, context.request_id);
-                } catch (BadParamException& e) {
-                    response = buildErrorResponse(context.request_id, ERR_UNKNOWN_PARAM);
-                } catch (BadResponseException& e) {
-                    response = buildErrorResponse(context.request_id, ERR_UNKNOWN_RESPONSE);
-                } catch (...) {
-                    response = buildErrorResponse(context.request_id, ERR_BAD_INTERNAL);
+                    auto key = std::pair{context.service_name, context.func_name};
+                    if (handlers_.contains(key)) {
+                        auto& func = handlers_[key];
+                        std::string response;
+                        try {
+                            response = co_await ThreadPoolWaiter<std::string>(threadPool_,
+                                [&func, &context]() -> std::string {
+                                return func(context.params);
+                            });
+                        } catch (RpcBadParamException& e) {
+                            response = buildErrorResponse(context.request_id, ERR_UNKNOWN_PARAM);
+                        } catch (RpcBadResponseException& e) {
+                            // 这个异常应该是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+                            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+                            response = buildErrorResponse(context.request_id, ERR_UNKNOWN_RESPONSE);
+                        } catch (std::exception& e) {
+                            // 走到这里应该也是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+                            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+                            response = buildErrorResponse(context.request_id, ERR_BAD_INTERNAL);
+                        }
+                        co_await WriterWaiter{session->socket, buildResponse(response, context.request_id)};
+                    } else if (streamHandlers_.contains(key)) {
+                        auto& func = streamHandlers_[key];
+                        auto getStringStream = [](RpcSession& session)-> AsyncGenerator<std::string> {
+                            while (auto s = co_await session.channel.next()) {
+                                co_yield std::move(*s);
+                            }
+                        };
+                        std::string errorResponse;
+                        try {
+                            AsyncGenerator<std::string> stringStream = func(getStringStream(*session));
+                            while (auto s = co_await stringStream.next()) {
+                                co_await WriterWaiter{session->socket, buildStreamResponse(*s, context.request_id)};
+                            }
+                        } catch (RpcBadParamException& e) {
+                            errorResponse = buildErrorResponse(context.request_id, ERR_UNKNOWN_PARAM);
+                        } catch (RpcBadResponseException& e) {
+                            // 这个异常应该是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+                            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+                            errorResponse = buildErrorResponse(context.request_id, ERR_UNKNOWN_RESPONSE);
+                        } catch (std::exception& e) {
+                            // 走到这里应该也是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+                            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+                            errorResponse = buildErrorResponse(context.request_id, ERR_BAD_INTERNAL);
+                        }
+                        co_await WriterWaiter{session->socket, buildResponse(errorResponse, context.request_id)};
+                    } else {
+                        co_await WriterWaiter{session->socket, buildErrorResponse(context.request_id, ERR_UNKNOWN_FUNCTION)};
+                    }
+                    buffer.erase(0, offset);
+                    offset = 0;
+                    continue;
                 }
-            } else {
-                response = buildErrorResponse(context.request_id, ERR_UNKNOWN_FUNCTION);
+
+                if (session_context->result == ERROR) {
+                    RpcContext context(std::move(*session_context));
+                    *session_context = RpcContext{}; // 清空掉原来的 context
+                    co_await WriterWaiter{session->socket, buildErrorResponse(context.request_id, ERR_BAD_REQUEST)};
+                    buffer.erase(0, offset); // 移除有问题的字节
+                    offset = 0;
+                    continue;
+                }
+
+                if (session_context->result == WAITING) {
+                    // WAITING 什么都不用做
+                }
             }
         }
-
-        client->asyncWriteOnce(
-            [](bool success) {},
-            std::move(response)
-        );
+        LOG(INFO) << "RpcServer:: dispatch complete";
     }
+
+    // void dispatch(RpcContext&& context, const std::shared_ptr<ISocket>& client) {
+    //     assert(context.result != WAITING);
+    //     std::string response;
+    //     if (context.result == ERROR) {
+    //         response = buildErrorResponse(context.request_id, ERR_BAD_REQUEST);
+    //     } else if (context.result == COMPLETE) {
+    //         bool stream_find = streamHandlers_.contains(std::pair{context.service_name, context.func_name});
+    //         bool common_find = handlers_.contains(std::pair{context.service_name, context.func_name});
+    //
+    //         if (stream_find || common_find) {
+    //             LOG(DEBUG) << "Rpc server: dispatch function " << context.func_name;
+    //             try {
+    //                 std::string res;
+    //                 if (common_find) {
+    //                     res = handlers_[std::pair{context.service_name, context.func_name}](std::move(context.params));
+    //                 } else {
+    //                     assert(false); // 这个是旧的写法，暂时放在这里
+    //                 }
+    //                 response = buildResponse(res, context.request_id);
+    //             } catch (RpcBadParamException& e) {
+    //                 response = buildErrorResponse(context.request_id, ERR_UNKNOWN_PARAM);
+    //             } catch (RpcBadResponseException& e) {
+    //                 // 这个异常应该是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+    //                 LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+    //                 response = buildErrorResponse(context.request_id, ERR_UNKNOWN_RESPONSE);
+    //             } catch (std::exception& e) {
+    //                 // 走到这里应该也是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+    //                 LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+    //                 response = buildErrorResponse(context.request_id, ERR_BAD_INTERNAL);
+    //             }
+    //         } else {
+    //             response = buildErrorResponse(context.request_id, ERR_UNKNOWN_FUNCTION);
+    //         }
+    //     }
+    //
+    //     client->asyncWriteOnce(
+    //         [&client](bool success) {
+    //             if (!success) {
+    //                 LOG(WARNING) << "RpcServer: write error, close it " << client->getNative();
+    //                 client->close();
+    //             }
+    //         },
+    //         std::move(response)
+    //     );
+    // }
+
 
     void run(bool block) {
         context_->run(block);
@@ -573,6 +775,11 @@ public:
     void addHandler(const std::string& group, const std::string& name, RpcHandler&& handler) {
         LOG(DEBUG) << "RpcServer:: addHandler " << group << " " << name;
         handlers_[std::pair{group, name}] = std::move(handler);
+    }
+
+    void addStreamHandler(const std::string& group, const std::string& name, RpcStreamHandler&& handler) {
+        LOG(DEBUG) << "RpcServer:: addStreamHandler " << group << " " << name;
+        streamHandlers_[std::pair{group, name}] = std::move(handler);
     }
 
     bool bindAndListen(const char* ip, short port) {
@@ -612,8 +819,16 @@ public:
     }
 };
 
-void RpcServer::addHandler(const std::string& group, const std::string& name, std::function<std::string(std::string buffer)> func) {
+void RpcServer::addHandler(const std::string& group, const std::string& name, std::function<std::string(std::string buffer)> func) const {
     impl->addHandler(group, name, std::move(func));
+}
+
+void RpcServer::addStreamHandler(
+    const std::string& group,
+    const std::string& name,
+    std::function<AsyncGenerator<std::string>(AsyncGenerator<std::string> bufferStream)> func
+) const {
+    impl->addStreamHandler(group, name, std::move(func));
 }
 
 void RpcServer::registerService(std::unique_ptr<RpcServiceBase> service) {

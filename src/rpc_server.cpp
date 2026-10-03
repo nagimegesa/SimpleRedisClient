@@ -11,6 +11,7 @@ struct Hello : RpcService<Hello> {
     virtual void setup(RpcServer& server) override {
         registerServiceName(server, "HelloService");
         registerFunction(server, "hello", &Hello::hello);
+        registerStreamFunction(server, "helloStream", &Hello::helloStream);
     }
 
     HelloWorldResponse hello(HelloWorldRequest req) {
@@ -20,7 +21,16 @@ struct Hello : RpcService<Hello> {
         } else {
             resp.set_res(req.msg());
         }
+
         return resp;
+    }
+
+    AsyncGenerator<HelloWorldResponse> helloStream(AsyncGenerator<HelloWorldRequest> req) {
+        while (auto r = co_await req.next()) {
+            HelloWorldResponse resp;
+            resp.set_res(r->msg());
+            co_yield resp;
+        }
     }
 };
 

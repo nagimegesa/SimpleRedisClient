@@ -6,20 +6,38 @@
 #define DEMO_RPCSERVER_H
 
 #include <functional>
+#include <functional>
 #include <memory>
 #include <string>
 #include <google/protobuf/message.h>
 
+#include "corou/Generator.h"
+#include "socket/socket.h"
+
 /*
  * struct HelloRpc : public RpcService<HelloRpc> {
  *     virtual void setup(RpcServer& server) override {
- *         registerFunction(server, "HelloService", "hello", &HelloRpc::hello);
+ *         registerServiceName(server, "hello");
+ *         registerFunction(server, "hello", &HelloRpc::hello);
+ *         registerStreamFunction(server, "helloStream", *HellpRpc::helloStream");
  *     }
  *
  *     HelloWorldResponse hello(HelloWorldRequest request) {
  *         HelloWorldResponse response;
  *         response.set_res("world");
  *         return response;
+ *     }
+ *
+ *     void helloStream(HelloWorldRequest request, const RpcWriter& writer) {
+ *          for(int i : request) {
+ *              HelloWorldResponse res;
+ *              res.set_res("world");
+ *              for(int i = 0; i < 4; ++i) {
+ *                  co_return xxx;
+ *              }
+ *          }
+ *
+ *          return nullptr;
  *     }
  * }
  *
@@ -32,11 +50,20 @@
 
 struct RpcServiceBase;
 
+
 class RpcServer {
+public:
+    class RpcWriter;
+
 private:
     struct RpcServerImpl;
     std::unique_ptr<RpcServerImpl> impl;
-    void addHandler(const std::string& group, const std::string& name, std::function<std::string(std::string buffer)> func);
+    void                           addHandler(const std::string& group, const std::string& name, std::function<std::string(std::string buffer)> func) const;
+    void                           addStreamHandler(
+        const std::string&                                                                 group,
+        const std::string&                                                                 name,
+        std::function<AsyncGenerator<std::string>(AsyncGenerator<std::string> bufferStream)> func
+    ) const;
     template <typename Derived> friend struct RpcService;
 
 public:
@@ -47,7 +74,19 @@ public:
     void registerServiceName(const std::string& name);
     RpcServer();
     ~RpcServer();
+
+    class RpcWriter {
+        struct Impl;
+        std::unique_ptr<Impl> impl;
+    public:
+        bool write(::google::protobuf::Message& message) const;
+        RpcWriter();
+        ~RpcWriter() = default;
+        friend RpcServerImpl;
+    };
 };
+
+using RpcWriter = RpcServer::RpcWriter;
 
 struct RpcServiceBase {
     virtual      ~RpcServiceBase() = default;
@@ -59,14 +98,14 @@ public:
     explicit RpcException(const std::string& msg) : std::runtime_error(msg) {}
 };
 
-class BadParamException : public std::runtime_error {
+class RpcBadParamException : public RpcException {
 public:
-    explicit BadParamException(const std::string& msg) : std::runtime_error(msg) {}
+    explicit RpcBadParamException(const std::string& msg) : RpcException(msg) {}
 };
 
-class BadResponseException : public std::runtime_error {
+class RpcBadResponseException : public RpcException {
 public:
-    explicit BadResponseException(const std::string& msg) : std::runtime_error(msg) {}
+    explicit RpcBadResponseException(const std::string& msg) : RpcException(msg) {}
 };
 
 template<typename Derived>
@@ -82,12 +121,12 @@ struct RpcService : RpcServiceBase {
                           [func, this](const std::string& buffer) -> std::string {
                               Arg req;
                               if (!req.ParseFromString(buffer)) {
-                                  throw BadParamException("bad parameters");
+                                  throw RpcBadParamException("bad parameters");
                               }
                               Ret         ret = (static_cast<Derived*>(this)->*func)(std::move(req));
                               std::string out;
                               if (!ret.SerializeToString(&out)) {
-                                  throw BadResponseException("bad response");
+                                  throw RpcBadResponseException("bad response");
                               }
                               return out;
                           }
@@ -101,7 +140,7 @@ struct RpcService : RpcServiceBase {
                               Ret         ret = (static_cast<Derived*>(this)->*func)();
                               std::string out;
                               if (!ret.SerializeToString(&out)) {
-                                  throw BadResponseException("bad response");
+                                  throw RpcBadResponseException("bad response");
                               }
                               return out;
                           }
@@ -114,7 +153,7 @@ struct RpcService : RpcServiceBase {
                           [func, this](const std::string& buffer) -> std::string {
                               Arg req;
                               if (!req.ParseFromString(buffer)) {
-                                  throw BadParamException("bad parameters");
+                                  throw RpcBadParamException("bad parameters");
                               }
                               (static_cast<Derived*>(this)->*func)(std::move(req));
                               return "";
@@ -131,6 +170,41 @@ struct RpcService : RpcServiceBase {
         );
     }
 
+    template <typename Ret, typename Arg> requires std::is_base_of_v<::google::protobuf::Message, Ret>
+        && std::is_base_of_v<::google::protobuf::Message, Arg>
+    void registerStreamFunction(RpcServer& server, const std::string& name, AsyncGenerator<Ret>(Derived::*func)(AsyncGenerator<Arg>)) {
+        server.addStreamHandler(serviceName, name,
+                                [func, this](AsyncGenerator<std::string> stringStream) -> AsyncGenerator<std::string> {
+                                    return t2StringStream(
+                                        (static_cast<Derived*>(this)->*func)(
+                                            stringStream2T<Arg>(std::move(stringStream))
+                                        )
+                                    );
+                                }
+        );
+    }
+
+    template <typename T>  requires std::is_base_of_v<::google::protobuf::Message, T>
+    AsyncGenerator<T> stringStream2T(AsyncGenerator<std::string> stringStream) {
+        while (auto n = co_await stringStream.next()) {
+            T req;
+            if (!req.ParseFromString(*n)) {
+                throw RpcBadParamException("bad parameters");
+            }
+            co_yield std::move(req);
+        }
+    }
+
+    template <typename T> requires std::is_base_of_v<::google::protobuf::Message, T>
+    AsyncGenerator<std::string> t2StringStream(AsyncGenerator<T> tStream) {
+        while (auto n = co_await tStream.next()) {
+            std::string resp;
+            if (!n->SerializeToString(&resp)) {
+                throw RpcBadResponseException("bad response");
+            }
+            co_yield std::move(resp);
+        }
+    }
 
     static std::unique_ptr<Derived> create() {
         return std::make_unique<Derived>();
@@ -146,5 +220,6 @@ void RpcService<Derived>::registerServiceName(RpcServer& server, const std::stri
     serviceName = name;
     server.registerServiceName(name);
 }
+
 
 #endif //DEMO_RPCSERVER_H

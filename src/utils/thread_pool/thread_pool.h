@@ -16,18 +16,40 @@
 struct Result {
     std::any result;
     std::exception_ptr exception;
+    bool moved = false;
+    bool throw_exception = false;
     template <class T>
     T get() {
+        if (moved) {
+            throw std::logic_error("the result can't get twice");
+        }
+        checkException();
+        T res = any_cast<T>(result); // 这里可能抛出 any_cast, 所以要在moved前面执行
+        moved = true;
+        return std::move(res);
+    }
 
+    void get_void() {
+        moved = true;
+        checkException();
+    }
+
+    void checkException() {
         if (exception) {
+            throw_exception = true;
             std::rethrow_exception(exception);
         }
-
-        return any_cast<T>(result);
     }
+
     Result(std::nullptr_t) {}
     Result(std::any result) : result(std::move(result)) {}
     Result(std::any result, std::exception_ptr exception) : result(std::move(result)), exception(std::move(exception)) {}
+
+    ~Result() {
+        if (exception && !throw_exception) {
+            std::terminate();
+        }
+    }
 };
 
 template <class T>
@@ -110,6 +132,9 @@ public:
     }
 
     void join();
+    bool is_joinable() const {
+        return !joined;
+    }
 
 private:
     void enqueue_callback(std::function<void()> func);
