@@ -27,7 +27,7 @@ public:
         return *this;
     }
 
-    LogEntry& operator<<(std::ostream& (*manip)(std::ostream&)) {
+    LogEntry&  operator<<(std::ostream& (*manip)(std::ostream&)) {
         stream_ << manip;
         return *this;
     }

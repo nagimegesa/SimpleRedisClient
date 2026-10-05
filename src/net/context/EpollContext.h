@@ -7,6 +7,8 @@
 #include <chrono>
 #include <memory>
 
+#include "corou/Generator.h"
+
 
 #ifndef __linux__
 static_assert(false, "this context is only for linux");
@@ -50,6 +52,7 @@ public:
     void registerLowLevelCallback(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) const;
     void registerCloseCallback(const std::shared_ptr<ISocket>& socket, const ClosingCallback& callback) const;
     void postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const;
+    void postCoroutineTask(const std::shared_ptr<ISocket>& socket, const std::function<Task<void>()>& function) const;
     ISocket::SocketHandler addTimer(
         const std::shared_ptr<ISocket>&  socket,
         const std::chrono::milliseconds& milliseconds,

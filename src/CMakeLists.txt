@@ -9,3 +9,12 @@ target_link_libraries(redis_cli PRIVATE app_redis net utils)
 
 add_executable(rpc_server rpc_server.cpp ${PROTOC_SOURCES})
 target_link_libraries(rpc_server PRIVATE app_rpc net utils)
+
+#add_compile_options(
+#        -fsanitize=address
+#        -fno-omit-frame-pointer
+#        -g
+#)
+#target_link_options(rpc_server PRIVATE
+#        -fsanitize=address
+#)

@@ -10,10 +10,6 @@ target_include_directories(app_rpc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(app_rpc PUBLIC ${CMAKE_SOURCE_DIR}/3rdparty/nacos-sdk-cpp/include)
 target_link_libraries(app_rpc PUBLIC net utils)
 
-if (${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
-    target_compile_options(app_rpc PRIVATE -fcoroutines)
-endif ()
-
 target_link_libraries(app_rpc PUBLIC
         ${CMAKE_SOURCE_DIR}/3rdparty/nacos-sdk-cpp/libnacos-cli-static.a
         curl

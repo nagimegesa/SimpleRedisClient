@@ -5,6 +5,9 @@
 #include "RpcServer.h"
 #include <string>
 #include <future>
+#include <bits/fs_fwd.h>
+#include <sys/socket.h>
+
 #include "corou/Generator.h"
 #include "thread_pool/thread_pool.h"
 #include "context/EpollContext.h"
@@ -13,6 +16,7 @@
 #include "Nacos.h"
 #include "corou/Waiter.h"
 
+// 这个是旧的协议
 /*
  * 0x0a 0x0b    // 2
  * type 1 字节  1 = REQUEST 2 = RESPONSE 3 = ERROR server端只会接收到 1 // 3
@@ -27,21 +31,34 @@
  * 0x0b 0x0c // 20 + service_len + func_len + parma_len
  */
 
+// 这个是新的协议
+/*
+ * 0x0a 0x0b    // 2
+ * type 1 字节  1 = REQUEST 2 = RESPONSE 3 = STREAM_REQUEST 4 = STREAM_RESPONSE 5 = STREAM_END 255 = ERROR server端只会接收到 1 3 5 // 3
+ * request_id 8 字节 大端 无符号，不能为 0 // 11
+ * stream_id 8 字节 大端 无符号，若是 STREAM_xxx 或者 STREAM_ERROR 不能为 0， 否则为 0 // 19
+ * error_code  1 字节，server 端只会接收到 0 // 20
+ * service_len 1 字节 // 21
+ * func_len 1 字节 // 22
+ * parma_len  2 字节 大端 // 24
+ * service_name for service_len
+ * function name for func_len // service_len + func_len
+ * serialize parma for parma_len // service_len + func_len + parma_len
+ * 0x0b 0x0c // 26 + service_len + func_len + parma_len
+ */
+
 
 /* region 解析协议 */
 
 enum ParserStatus {
-    SOA, SOB,
-    TYPE,
-    REQUEST_ID,
-    ERROR_CODE,
-    SERVICE_LEN,
-    SERVICE_NAME,
-    FUNC_LEN,
-    FUNC_NAME,
-    PARAM_LEN,
-    PARAM_STRING,
-    EOB, EOC,
+    SOA,          // 找 0x0a
+    SOB,          // 校验 0x0b
+    HEADER,       // 读固定头 22 字节并统一校验
+    SERVICE_NAME, // 读 service_name
+    FUNC_NAME,    // 读 func_name
+    PARAM_STRING, // 读 params
+    EOB,          // 校验 0x0b
+    EOC,          // 校验 0x0c，完成
 };
 
 enum ParserResult {
@@ -51,126 +68,301 @@ enum ParserResult {
 };
 
 enum ErrorCode : char {
-    ERR_BAD_REQUEST = 1,
-    ERR_BAD_INTERNAL = 3,
+    ERR_BAD_INTERNAL = 0,
+    ERR_BAD_REQUEST  = 1,
+    ERR_BAD_STREAM_ID = 2,
+    ERR_BAD_STREAM_TYPE = 3,
 
     ERR_UNKNOWN_FUNCTION = 100,
-    ERR_UNKNOWN_PARAM = 101,
+    ERR_UNKNOWN_PARAM    = 101,
     ERR_UNKNOWN_RESPONSE = 102,
 };
 
-enum RequestType : char {
-    REQUEST = 1,
-    RESPONSE = 2,
-    REQ_ERROR = 3,
+enum RequestType : unsigned char {
+    REQUEST          = 1,
+    RESPONSE         = 2,
+    STREAM_REQUEST   = 3,
+    STREAM_RESPONSE  = 4,
+    STREAM_END       = 5,
+    REQ_ERROR        = 255,
 };
 
 struct RpcContext {
     ParserStatus status;
     ParserResult result;
+
+    RequestType type;
     std::uint64_t request_id;
+    std::uint64_t stream_id;
+
     std::string service_name;
     std::string func_name;
     std::string params;
     std::vector<char> buffer;
 
-    RpcContext() : status(SOA), result(WAITING), request_id(0) {}
+    RpcContext()
+        : status(SOA),
+          result(WAITING),
+          type(REQUEST),
+          request_id(0),
+          stream_id(0) {}
 
-    void reset_message() {
-        request_id = 0;
+    void resetMessage() {
+        // 故意不清 type / request_id / stream_id，便于错误处理时回错误响应。
         service_name.clear();
         func_name.clear();
         params.clear();
         buffer.clear();
     }
+
+    bool isStream() const {
+        return type == STREAM_REQUEST || type == STREAM_END && stream_id != 0;
+    }
+
+    bool isRequest() const {
+        return type == REQUEST && request_id != 0;
+    }
+
+    RpcContext(RpcContext&& context) noexcept
+        : status(context.status),
+          result(context.result),
+          type(context.type),
+          request_id(context.request_id),
+          stream_id(context.stream_id),
+          service_name(std::move(context.service_name)),
+          func_name(std::move(context.func_name)),
+          params(std::move(context.params)),
+          buffer(std::move(context.buffer)) {
+        context.status = SOA;
+        context.result = WAITING;
+        context.type = REQUEST;
+        context.request_id = 0;
+        context.stream_id = 0;
+    }
+
+    RpcContext& operator=(RpcContext&& context) noexcept {
+        if (this != &context) {
+            status = context.status;
+            result = context.result;
+            type = context.type;
+            request_id = context.request_id;
+            stream_id = context.stream_id;
+            service_name = std::move(context.service_name);
+            func_name = std::move(context.func_name);
+            params = std::move(context.params);
+            buffer = std::move(context.buffer);
+
+            context.status = SOA;
+            context.result = WAITING;
+            context.type = REQUEST;
+            context.request_id = 0;
+            context.stream_id = 0;
+        }
+        return *this;
+    }
 };
 
 namespace {
+    constexpr unsigned char kMagic0 = 0x0a;
+    constexpr unsigned char kMagic1 = 0x0b;
+    constexpr unsigned char kMagic2 = 0x0c;
 
-constexpr unsigned char kMagic0 = 0x0a;
-constexpr unsigned char kMagic1 = 0x0b;
-constexpr unsigned char kMagic2 = 0x0c;
+    // 固定头长度：type(1)+request_id(8)+stream_id(8)+error_code(1)
+    //            +service_len(1)+func_len(1)+param_len(2) = 22
+    constexpr std::size_t kFixedHeaderSize = 22;
 
-inline unsigned char u8(char c) {
-    return static_cast<unsigned char>(c);
-}
+    // 固定头内部偏移
+    constexpr std::size_t kOffsetType       = 0;
+    constexpr std::size_t kOffsetRequestId  = 1;
+    constexpr std::size_t kOffsetStreamId   = 9;
+    constexpr std::size_t kOffsetErrorCode  = 17;
+    constexpr std::size_t kOffsetServiceLen = 18;
+    constexpr std::size_t kOffsetFuncLen    = 19;
+    constexpr std::size_t kOffsetParamLen   = 20;
 
-inline void append_u64_be(std::string& out, std::uint64_t v) {
-    for (int shift = 56; shift >= 0; shift -= 8) {
-        out.push_back(static_cast<char>((v >> shift) & 0xff));
+    inline unsigned char u8(char c) { return static_cast<unsigned char>(c); }
+
+    inline void append_u64_be(std::string& out, std::uint64_t v) {
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            out.push_back(static_cast<char>((v >> shift) & 0xff));
+        }
     }
-}
 
-inline void append_u32_be(std::string& out, std::uint32_t v) {
-    out.push_back(static_cast<char>((v >> 24) & 0xff));
-    out.push_back(static_cast<char>((v >> 16) & 0xff));
-    out.push_back(static_cast<char>((v >> 8) & 0xff));
-    out.push_back(static_cast<char>(v & 0xff));
-}
-
-inline std::uint64_t read_u64_be(const char* p) {
-    std::uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) {
-        v = (v << 8) | static_cast<unsigned char>(p[i]);
+    inline void append_u32_be(std::string& out, std::uint32_t v) {
+        out.push_back(static_cast<char>((v >> 24) & 0xff));
+        out.push_back(static_cast<char>((v >> 16) & 0xff));
+        out.push_back(static_cast<char>((v >> 8) & 0xff));
+        out.push_back(static_cast<char>(v & 0xff));
     }
-    return v;
-}
 
-inline std::uint32_t read_u32_be(const char* p) {
-    std::uint32_t v = 0;
-    for (int i = 0; i < 4; ++i) {
-        v = (v << 8) | static_cast<unsigned char>(p[i]);
+    inline void append_u16_be(std::string& out, std::uint16_t v) {
+        out.push_back(static_cast<char>((v >> 8) & 0xff));
+        out.push_back(static_cast<char>(v & 0xff));
     }
-    return v;
-}
 
-inline void append_magic_begin(std::string& out) {
-    out.push_back(static_cast<char>(kMagic0));
-    out.push_back(static_cast<char>(kMagic1));
-}
+    inline std::uint64_t read_u64_be(const char* p) {
+        std::uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) {
+            v = (v << 8) | static_cast<unsigned char>(p[i]);
+        }
+        return v;
+    }
 
-inline void append_magic_end(std::string& out) {
-    out.push_back(static_cast<char>(kMagic1));
-    out.push_back(static_cast<char>(kMagic2));
-}
+    inline std::uint32_t read_u32_be(const char* p) {
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) {
+            v = (v << 8) | static_cast<unsigned char>(p[i]);
+        }
+        return v;
+    }
 
-}  // namespace
+    inline std::uint16_t read_u16_be(const char* p) {
+        return static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(static_cast<unsigned char>(p[0])) << 8) |
+            static_cast<std::uint16_t>(static_cast<unsigned char>(p[1]))
+        );
+    }
 
-// 0x0a 0x0b | type(3) | request_id(8) | error_code(1) | param_len(4)=0 | 0x0b 0x0c
+    inline void append_magic_begin(std::string& out) {
+        out.push_back(static_cast<char>(kMagic0));
+        out.push_back(static_cast<char>(kMagic1));
+    }
+
+    inline void append_magic_end(std::string& out) {
+        out.push_back(static_cast<char>(kMagic1));
+        out.push_back(static_cast<char>(kMagic2));
+    }
+} // namespace
+
+// 请求级错误：stream_id = 0
 std::string buildErrorResponse(std::uint64_t request_id, char error_code) {
     std::string res;
-    res.reserve(18);
+    res.reserve(26);
 
     append_magic_begin(res);
-    res.push_back(static_cast<char>(RequestType::REQ_ERROR));
+    res.push_back(static_cast<char>(REQ_ERROR)); // 255
     append_u64_be(res, request_id);
+    append_u64_be(res, 0); // stream_id = 0，请求级错误
     res.push_back(error_code);
-    append_u32_be(res, 0); // parma_len 0
+    res.push_back(0);
+    res.push_back(0);
+    append_u16_be(res, 0);
     append_magic_end(res);
 
     return res;
 }
 
-// 0x0a 0x0b | type(2) | request_id(8) | error_code(1)=0 |
-// param_len(4) | body | 0x0b 0x0c
-std::string buildResponse(const std::string& body, std::uint64_t request_id) {
+// 流级错误：stream_id != 0
+std::string buildErrorResponse(
+    std::uint64_t request_id,
+    std::uint64_t stream_id,
+    char error_code
+) {
     std::string res;
-    res.reserve(18 + body.size());
+    res.reserve(26);
+
+    append_magic_begin(res);
+    res.push_back(static_cast<char>(REQ_ERROR)); // 255
+    append_u64_be(res, request_id);
+    append_u64_be(res, stream_id);
+    res.push_back(error_code);
+    res.push_back(0);
+    res.push_back(0);
+    append_u16_be(res, 0);
+    append_magic_end(res);
+
+    return res;
+}
+
+// 非流式响应：stream_id = 0
+std::string buildResponse(const std::string& body, std::uint64_t request_id) {
+    if (body.size() > 0xffffu) {
+        return buildErrorResponse(
+            request_id,
+            static_cast<char>(ErrorCode::ERR_BAD_INTERNAL)
+        );
+    }
+
+    std::string res;
+    res.reserve(26 + body.size());
 
     append_magic_begin(res);
     res.push_back(static_cast<char>(RequestType::RESPONSE));
     append_u64_be(res, request_id);
-    res.push_back(0);   // error code 0
-    append_u32_be(res, static_cast<std::uint32_t>(body.size()));
+    append_u64_be(res, 0); // stream_id = 0，非流式
+    res.push_back(0);
+    res.push_back(0);
+    res.push_back(0);
+    append_u16_be(res, static_cast<std::uint16_t>(body.size()));
     res.append(body);
     append_magic_end(res);
 
     return res;
 }
 
-std::string buildStreamResponse(const std::string& body, std::uint64_t request_id) {
-    // TODO: 实习这个函数，这里暂时使用 buildResponse替代
-    return buildResponse(body, request_id);
+// 流式响应数据帧：STREAM_RESPONSE，第一帧即 begin + data
+std::string buildStreamResponse(
+    const std::string& body,
+    std::uint64_t request_id,
+    std::uint64_t stream_id
+) {
+    if (stream_id == 0) {
+        // 没有 stream_id，构造不出合法流帧，只能回请求级错误。
+        return buildErrorResponse(
+            request_id,
+            static_cast<char>(ErrorCode::ERR_BAD_REQUEST)
+        );
+    }
+
+    if (body.size() > 0xffffu) {
+        // 超出 param_len 范围，回该流的流级错误。
+        return buildErrorResponse(
+            request_id,
+            stream_id,
+            static_cast<char>(ErrorCode::ERR_BAD_REQUEST)
+        );
+    }
+
+    std::string res;
+    res.reserve(26 + body.size());
+
+    append_magic_begin(res);
+    res.push_back(static_cast<char>(RequestType::STREAM_RESPONSE));
+    append_u64_be(res, request_id);
+    append_u64_be(res, stream_id);
+    res.push_back(0); // error_code
+    res.push_back(0); // service_len
+    res.push_back(0); // func_len
+    append_u16_be(res, static_cast<std::uint16_t>(body.size()));
+    res.append(body);
+    append_magic_end(res);
+
+    return res;
+}
+
+// 流式正常结束：STREAM_END，param_len = 0
+std::string buildStreamEnd(std::uint64_t request_id, std::uint64_t stream_id) {
+    if (stream_id == 0) {
+        return buildErrorResponse(
+            request_id,
+            static_cast<char>(ErrorCode::ERR_BAD_REQUEST)
+        );
+    }
+
+    std::string res;
+    res.reserve(26);
+
+    append_magic_begin(res);
+    res.push_back(static_cast<char>(RequestType::STREAM_END));
+    append_u64_be(res, request_id);
+    append_u64_be(res, stream_id);
+    res.push_back(0);
+    res.push_back(0);
+    res.push_back(0);
+    append_u16_be(res, 0);
+    append_magic_end(res);
+
+    return res;
 }
 
 inline void parse(
@@ -178,8 +370,8 @@ inline void parse(
     std::size_t start,
     std::size_t end,
     std::size_t& parsed,
-    RpcContext& context) {
-
+    RpcContext& context
+) {
     parsed = 0;
 
     if (start >= end) {
@@ -197,14 +389,14 @@ inline void parse(
         context.result = WAITING;
     };
 
+    // 出错时保留 type / request_id / stream_id，便于上层回错误响应。
     auto set_error = [&]() {
         context.result = ERROR;
         context.status = SOA;
-        context.reset_message();
+        context.resetMessage();
         parsed = i - start;
     };
 
-    // 从 buffer + data 中凑齐 need 个字节，放入 context.buffer
     auto read_fixed = [&](std::size_t need) -> bool {
         while (context.buffer.size() < need && i < end) {
             context.buffer.push_back(data[i++]);
@@ -218,7 +410,6 @@ inline void parse(
         return true;
     };
 
-    // 读取变长字段
     auto read_var = [&](std::size_t len, std::string& out) -> bool {
         if (out.size() > len) {
             set_error();
@@ -262,155 +453,98 @@ inline void parse(
         }
 
         case SOB: {
+            if (i >= end) {
+                set_waiting();
+                return;
+            }
+
             if (u8(data[i]) != kMagic1) {
                 set_error();
                 return;
             }
 
             ++i;
-            context.reset_message();
-            context.status = TYPE;
+            context.resetMessage();
+            context.type = RequestType::REQUEST;
+            context.request_id = 0;
+            context.stream_id = 0;
+            context.status = HEADER;
             break;
         }
 
-        case TYPE: {
-            if (i >= end) {
-                set_waiting();
+        case HEADER: {
+            if (!read_fixed(kFixedHeaderSize)) {
                 return;
             }
 
-            const unsigned char type = u8(data[i++]);
+            const char* h = context.buffer.data();
 
-            // server 端只接收 REQUEST
-            if (type != static_cast<unsigned char>(RequestType::REQUEST)) {
+            const unsigned char type       = u8(h[kOffsetType]);
+            const std::uint64_t request_id = read_u64_be(h + kOffsetRequestId);
+            const std::uint64_t stream_id  = read_u64_be(h + kOffsetStreamId);
+            const unsigned char error_code = u8(h[kOffsetErrorCode]);
+
+            context.type       = static_cast<RequestType>(type);
+            context.request_id = request_id;
+            context.stream_id  = stream_id;
+
+            if (type != static_cast<unsigned char>(RequestType::REQUEST) &&
+                type != static_cast<unsigned char>(RequestType::STREAM_REQUEST) &&
+                type != static_cast<unsigned char>(RequestType::STREAM_END)) {
                 set_error();
                 return;
             }
 
-            context.status = REQUEST_ID;
-            break;
-        }
-
-        case REQUEST_ID: {
-            if (!read_fixed(8)) {
-                return;
-            }
-
-            const std::uint64_t id = read_u64_be(context.buffer.data());
-            if (id == 0) {
+            if (request_id == 0) {
                 set_error();
                 return;
             }
 
-            context.request_id = id;
-            context.buffer.clear();
-            context.status = ERROR_CODE;
-            break;
-        }
-
-        case ERROR_CODE: {
-            if (i >= end) {
-                set_waiting();
+            if (type == static_cast<unsigned char>(RequestType::REQUEST) &&
+                stream_id != 0) {
+                set_error();
                 return;
             }
 
-            const unsigned char error_code = u8(data[i++]);
+            if (type == static_cast<unsigned char>(RequestType::STREAM_REQUEST) &&
+                stream_id == 0) {
+                set_error();
+                return;
+            }
 
-            // server 端收到的 REQUEST，error_code 必须为 0
             if (error_code != 0) {
                 set_error();
                 return;
             }
 
-            context.status = SERVICE_LEN;
-            break;
-        }
-
-        case SERVICE_LEN: {
-            if (i >= end) {
-                set_waiting();
-                return;
-            }
-
-            const unsigned char len = u8(data[i++]);
-
             context.service_name.clear();
-            context.service_name.reserve(len);
-
-            context.buffer.clear();
-            context.buffer.push_back(static_cast<char>(len));
-
+            context.func_name.clear();
+            context.params.clear();
             context.status = SERVICE_NAME;
             break;
         }
 
         case SERVICE_NAME: {
-            if (context.buffer.empty()) {
-                set_error();
+            const std::size_t service_len = u8(context.buffer[kOffsetServiceLen]);
+            if (!read_var(service_len, context.service_name)) {
                 return;
             }
-
-            const std::size_t len = u8(context.buffer[0]);
-            if (!read_var(len, context.service_name)) {
-                return;
-            }
-
-            context.buffer.clear();
-            context.status = FUNC_LEN;
-            break;
-        }
-
-        case FUNC_LEN: {
-            if (i >= end) {
-                set_waiting();
-                return;
-            }
-
-            const unsigned char len = u8(data[i++]);
-
-            context.func_name.clear();
-            context.func_name.reserve(len);
-
-            context.buffer.clear();
-            context.buffer.push_back(static_cast<char>(len));
-
             context.status = FUNC_NAME;
             break;
         }
 
         case FUNC_NAME: {
-            if (context.buffer.empty()) {
-                set_error();
+            const std::size_t func_len = u8(context.buffer[kOffsetFuncLen]);
+            if (!read_var(func_len, context.func_name)) {
                 return;
             }
-
-            const std::size_t len = u8(context.buffer[0]);
-            if (!read_var(len, context.func_name)) {
-                return;
-            }
-
-            context.buffer.clear();
-            context.status = PARAM_LEN;
-            break;
-        }
-
-        case PARAM_LEN: {
-            if (!read_fixed(4)) {
-                return;
-            }
-
-            context.params.clear();
             context.status = PARAM_STRING;
             break;
         }
 
         case PARAM_STRING: {
-            if (context.buffer.size() < 4) {
-                set_error();
-                return;
-            }
-
-            const std::uint32_t param_len = read_u32_be(context.buffer.data());
+            const std::uint16_t param_len =
+                read_u16_be(context.buffer.data() + kOffsetParamLen);
             if (!read_var(static_cast<std::size_t>(param_len), context.params)) {
                 return;
             }
@@ -461,100 +595,34 @@ inline void parse(
 
 /* endregion */
 
-struct Channel {
-    std::coroutine_handle<> waiter = nullptr;
-    std::deque<std::string> buffer;
-    bool closed_ = false;
-
-    struct ChannelWaiter {
-        Channel& channel;
-
-        bool await_ready() const noexcept { return channel.closed_  || !channel.buffer.empty(); }
-        bool await_suspend(std::coroutine_handle<> handle) const noexcept {
-            channel.waiter = handle;
-        }
-        void await_resume() const noexcept { }
-    };
-
-    void push(std::string string) {
-        buffer.push_back(std::move(string));
-        if (waiter) { // 这里这样写是为了防止 在写错调用期间 waiter 被覆盖，或者销毁（其实这里还没太搞懂, deepseek 教的）
-            auto h = waiter;
-            waiter = nullptr;
-            h.resume();
-        }
-    }
-
-    ChannelWaiter wait() {
-        return ChannelWaiter{*this};
-    }
-
-    Task<std::optional<std::string>> next() {
-        while (buffer.empty() && !closed_) {
-            co_await wait();
-        }
-
-        if (buffer.empty()) {
-            co_return std::nullopt;
-        }
-
-        auto t = std::move(buffer.front());
-        buffer.pop_front();
-        co_return std::move(t);
-    }
-
-    void close() {
-        closed_ = true;
-        if (waiter) {
-            auto h = waiter;
-            waiter = nullptr;
-            h.resume(); // close 的时候需要让 next 知道，然后返回 nullopt
-        }
-    }
-};
+struct RpcChannel;
 
 struct RpcSession {
-    std::shared_ptr<ISocket> socket;
-    Channel channel;
-    std::shared_ptr<RpcContext> context;
+    std::uint64_t request_id = 0;
+    std::uint64_t send_stream_id = 0;
+    std::uint64_t recv_stream_id = 0;
+    std::weak_ptr<RpcChannel> channel;
+    Channel<RpcContext> context_channel; // 一帧的完整数据
+    std::unique_ptr<Channel<std::string>> inChannel; // 帧数据提取出来的输入
+    std::unique_ptr<AsyncGenerator<std::string>> outGenerator; // 输出
+    RpcSession(uint64_t request_id, const std::weak_ptr<RpcChannel>& channel) : request_id(request_id), channel(channel) {}
+    RpcSession(RpcSession&& other)  noexcept = default;
+    RpcSession& operator=(RpcSession&& other) = delete;
+};
+
+// 一个socket 映射 一个 Rpc Channel
+struct RpcChannel {
+    std::weak_ptr<ISocket> socket;
+    Channel<std::string> channel;
+    // 一个 channel 可以有很多 session
+    std::unordered_map<std::uint64_t, std::shared_ptr<RpcSession>> sessions_;
 };
 
 using RpcHandler = std::function<std::string(std::string)>;
 using RpcStreamHandler = std::function<AsyncGenerator<std::string>(AsyncGenerator<std::string> bufferStream)>;
 
-struct RpcServer::RpcWriter::Impl {
-
-    std::uint64_t request_id = 0;
-    std::shared_ptr<ISocket> socket = nullptr;
-
-    bool write(const ::google::protobuf::Message& message) const {
-        std::string out;
-        if (message.SerializeToString(&out)) {
-            out = buildErrorResponse(request_id, ERR_UNKNOWN_RESPONSE);
-        }
-
-        if (socket) {
-            std::promise<bool> promise;
-            socket->asyncWriteOnce([&promise](bool success) {
-                promise.set_value(success);
-            }, buildStreamResponse(out, request_id));
-
-            return promise.get_future().get();
-        }
-
-        return false;
-    }
-};
-
-bool RpcServer::RpcWriter::write(::google::protobuf::Message& message) const {
-    return impl->write(message);
-}
-
-RpcServer::RpcWriter::RpcWriter() : impl(std::make_unique<Impl>()) {}
-
 struct RpcServer::RpcServerImpl {
 private:
-
     struct PairStringHash {
         std::size_t operator()(const std::pair<std::string, std::string>& p) const {
             const std::hash<std::string> hasher;
@@ -566,151 +634,276 @@ private:
     std::set<std::unique_ptr<RpcServiceBase>> services_; // 保留Service防止被析构
     std::unordered_map<std::pair<std::string, std::string>, RpcHandler, PairStringHash> handlers_;
     std::unordered_map<std::pair<std::string, std::string>, RpcStreamHandler, PairStringHash> streamHandlers_;
+
     std::shared_ptr<ISocket> socket_;
     ThreadPool threadPool_;
     std::unique_ptr<nacos::NamingService> namingService_;
 
     std::string server_ip;
     short server_port = 0;
-    bool use_nacos = true;
+    bool use_nacos = false;
 
     static constexpr std::string NACOS_SERVER_ADDRESS = "127.0.0.1:8848";
     static constexpr std::string NACOS_USER_NAME = "nacos";
     static constexpr std::string NACOS_PASSWORD = "nacos";
 
-
 public:
-    RpcServerImpl(): context_(std::make_shared<EpollContext>()), threadPool_(2), namingService_(nullptr) {
+    RpcServerImpl() : context_(std::make_shared<EpollContext>()), threadPool_(2), namingService_(nullptr) {
         socket_ = SocketManager::getInstance().getSocket(context_);
         socket_->asyncAccept([this](const std::shared_ptr<ISocket>& client) {
-            client->getContext()->postTask(client, [this, client]() {
-                acceptClient(client);
-            });
-        });
+                client->getContext()->postTask(client, [this, client]() { acceptClient(client); });
+            }
+        );
     }
 
-    Task<void> acceptClient(const std::shared_ptr<ISocket>& client) {
+    void acceptClient(const std::shared_ptr<ISocket>& client) {
         LOG(DEBUG) << "RpcServer:: accept a new client";
 
-        auto context = std::make_shared<RpcContext>(); // 这个 context 会保存到 close
+        // 一个 socket 对应唯一的 channel, channel 管理和分发 session
+        std::shared_ptr<RpcChannel> channel = std::make_shared<RpcChannel>();
+        channel->socket = client;
 
-        auto session = std::make_shared<RpcSession>();
-        session->socket = client;
-        session->context = context;
-        session->channel = Channel{};
+        client->getContext()->postCoroutineTask(client,
+                                                [channel, this]() -> Task<void> {
+                                                    return dispatch(channel);
+                                                }
+        );
 
-        client->getContext()->postTask(client, [this, session]() {
-            dispatch(session);
-        });
-
-        // session 会跟着 socket 销毁
-        client->asyncRead([client, session](const std::string& buffer, std::size_t size) {
-            LOG(DEBUG) << "RpcServer: read " << " size " << size << " fd " << client->getNative();
-            if (size == 0) {
-                client->close();
+        // 这里把 channel 的声明命周期绑定到了 socket，读事件被移除的时候 channel也会被析构
+        client->asyncRead([client, channel](const std::string& buffer, std::size_t size) {
+                LOG(DEBUG) << "RpcServer: read " << " size " << size << " fd " << client->getNative();
+                if (size == 0) {
+                    client->close();
+                    return size;
+                }
+                channel->channel.push(buffer);
                 return size;
             }
-
-            session->channel.push(buffer);
-            return size;
-        });
+        );
 
         client->registerCloseCallback([](const std::shared_ptr<ISocket>& client) {
-            LOG(DEBUG) << "RpcServer: close " << client->getNative();
-        });
-
-        co_return;
+                LOG(DEBUG) << "RpcServer: close " << client->getNative();
+            }
+        );
     }
 
-    /**
-     * TODO: 这个 dispatch 因为还没有修改二进制协议，同时 一个 session 只能支持一个流，后面改了协议可以解决这个问题
-     * @param session
-     * @return
-     */
-    Task<void> dispatch(std::shared_ptr<RpcSession> session) {
+    Task<void> dispatch(std::shared_ptr<RpcChannel> channel) {
+        LOG(DEBUG) << "RpcServer:: dispatch " << channel->socket.lock()->getNative();
         std::string buffer;
-        while (auto t_buffer = co_await session->channel.next()) {
+        RpcContext session_context;
+        std::size_t offset = 0;
+        while (auto t_buffer = co_await channel->channel.next()) {
             buffer.append(*t_buffer);
-            auto& session_context = session->context;
-            std::size_t offset = 0;
             while (offset < buffer.size()) {
                 std::size_t parsed = 0;
-                parse(buffer, offset, buffer.size(), parsed, *session_context);
+                parse(buffer, offset, buffer.size(), parsed, session_context);
                 offset += parsed;
-                if (session_context->result == COMPLETE) {
-
-                    RpcContext context(std::move(*session_context));
-                    *session_context = RpcContext{}; // 清空掉原来的 context
-
+                if (session_context.result == COMPLETE) {
+                    RpcContext context(std::move(session_context)); // move 的时候清空了 session_context
                     auto key = std::pair{context.service_name, context.func_name};
-                    if (handlers_.contains(key)) {
-                        auto& func = handlers_[key];
-                        std::string response;
-                        try {
-                            response = co_await ThreadPoolWaiter<std::string>(threadPool_,
-                                [&func, &context]() -> std::string {
-                                return func(context.params);
-                            });
-                        } catch (RpcBadParamException& e) {
-                            response = buildErrorResponse(context.request_id, ERR_UNKNOWN_PARAM);
-                        } catch (RpcBadResponseException& e) {
-                            // 这个异常应该是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
-                            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
-                            response = buildErrorResponse(context.request_id, ERR_UNKNOWN_RESPONSE);
-                        } catch (std::exception& e) {
-                            // 走到这里应该也是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
-                            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
-                            response = buildErrorResponse(context.request_id, ERR_BAD_INTERNAL);
-                        }
-                        co_await WriterWaiter{session->socket, buildResponse(response, context.request_id)};
-                    } else if (streamHandlers_.contains(key)) {
-                        auto& func = streamHandlers_[key];
-                        auto getStringStream = [](RpcSession& session)-> AsyncGenerator<std::string> {
-                            while (auto s = co_await session.channel.next()) {
-                                co_yield std::move(*s);
-                            }
-                        };
-                        std::string errorResponse;
-                        try {
-                            AsyncGenerator<std::string> stringStream = func(getStringStream(*session));
-                            while (auto s = co_await stringStream.next()) {
-                                co_await WriterWaiter{session->socket, buildStreamResponse(*s, context.request_id)};
-                            }
-                        } catch (RpcBadParamException& e) {
-                            errorResponse = buildErrorResponse(context.request_id, ERR_UNKNOWN_PARAM);
-                        } catch (RpcBadResponseException& e) {
-                            // 这个异常应该是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
-                            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
-                            errorResponse = buildErrorResponse(context.request_id, ERR_UNKNOWN_RESPONSE);
-                        } catch (std::exception& e) {
-                            // 走到这里应该也是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
-                            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
-                            errorResponse = buildErrorResponse(context.request_id, ERR_BAD_INTERNAL);
-                        }
-                        co_await WriterWaiter{session->socket, buildResponse(errorResponse, context.request_id)};
+                    if (context.isStream()) {
+                        co_await handleStreamRequest(key, std::move(context), channel);
+                    } else if (context.isRequest()) {
+                        co_await handleCommonRequest(key, context, channel->socket);
                     } else {
-                        co_await WriterWaiter{session->socket, buildErrorResponse(context.request_id, ERR_UNKNOWN_FUNCTION)};
+                        assert (false); // 这个分支实际上是 session_context.result == ERROR
                     }
+
                     buffer.erase(0, offset);
                     offset = 0;
                     continue;
                 }
 
-                if (session_context->result == ERROR) {
-                    RpcContext context(std::move(*session_context));
-                    *session_context = RpcContext{}; // 清空掉原来的 context
-                    co_await WriterWaiter{session->socket, buildErrorResponse(context.request_id, ERR_BAD_REQUEST)};
+                if (session_context.result == ERROR) {
+                    LOG(DEBUG) << "RpcServer:: dispatch error " << session_context.result << " ";
+                    RpcContext context(std::move(session_context));
+                    co_await WriterWaiter{
+                        channel->socket.lock(),
+                        buildErrorResponse(context.request_id, ERR_BAD_REQUEST)
+                    };
                     buffer.erase(0, offset); // 移除有问题的字节
                     offset = 0;
                     continue;
                 }
 
-                if (session_context->result == WAITING) {
-                    // WAITING 什么都不用做
+                if (session_context.result == WAITING) {
+                    break;
                 }
             }
         }
         LOG(INFO) << "RpcServer:: dispatch complete";
+    }
+
+    Task<void> handleCommonRequest(const auto& key, const RpcContext& context, const std::weak_ptr<ISocket> socket) {
+
+        if (!handlers_.contains(key)) {
+            co_await WriterWaiter{ socket.lock(),
+                buildErrorResponse(context.request_id, ERR_UNKNOWN_FUNCTION)};
+            co_return;
+        }
+
+        auto& func = handlers_[key];
+        std::string response;
+        try {
+            std::string res = co_await ThreadPoolWaiter<std::string>(threadPool_,
+                                                              [&func, &context]() -> std::string {
+                                                                  return func(context.params);
+                                                              }
+            );
+            response = buildResponse(res, context.request_id);
+        } catch (RpcBadParamException& e) {
+            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+            response = buildErrorResponse(context.request_id, ERR_UNKNOWN_PARAM);
+        } catch (RpcBadResponseException& e) {
+            // 这个异常应该是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+            response = buildErrorResponse(context.request_id, ERR_UNKNOWN_RESPONSE);
+        } catch (std::exception& e) {
+            // 走到这里应该也是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+            LOG(ERR) << "Rpc server: dispatch " << context.service_name << " " << context.func_name << ": " << e.what();
+            response = buildErrorResponse(context.request_id, ERR_BAD_INTERNAL);
+        }
+        co_await WriterWaiter{socket.lock(), std::move(response)};
+    }
+
+    Task<void> handleStreamRequest(const auto& key, RpcContext&& context, std::shared_ptr<RpcChannel> channel) {
+
+        auto& socket = channel->socket;
+        auto& sessions_ = channel->sessions_;
+
+        if (!streamHandlers_.count(key)) {
+            co_await WriterWaiter{socket.lock(),
+                buildErrorResponse(context.request_id, context.stream_id, ERR_UNKNOWN_FUNCTION)};
+            co_return;
+        }
+
+        auto& handler = streamHandlers_[key];
+        auto id = context.request_id;
+        std::shared_ptr<RpcSession> session = nullptr;
+        if (sessions_.contains(id)) {
+            session = sessions_[id];
+        } else {
+            if (context.type == STREAM_END) { // 第一帧不能是STREAM_END
+                co_await WriterWaiter{socket.lock(),
+                buildErrorResponse(context.request_id, context.stream_id, ERR_BAD_STREAM_TYPE) };
+                co_return;
+            }
+
+            if (context.stream_id != 1) { // stream_id 只能从1开始依次递增
+                co_await WriterWaiter{socket.lock(),
+                    buildErrorResponse(context.request_id, context.stream_id, ERR_BAD_STREAM_ID) };
+                co_return;
+            }
+            session = std::make_shared<RpcSession>(id, channel);
+            sessions_[id] = session;
+            session->request_id = context.request_id;
+            auto socketShared = socket.lock();
+            socketShared->getContext()->postCoroutineTask(socketShared,
+                [this, handler, session]() -> Task<void> {
+                return sessionRecvLoop(handler, session);
+            });
+        }
+
+        if (context.stream_id != session->recv_stream_id + 1) { // stream_id 只能从1开始依次递增
+            co_await WriterWaiter{socket.lock(),
+                buildErrorResponse(context.request_id, context.stream_id, ERR_BAD_STREAM_ID) };
+            session->context_channel.close();                   // 写错了说明客户端异常，直接关闭
+            co_return;
+        }
+
+        if (context.type == STREAM_END) {                       // 收到 STREAM END 关闭读通道
+            LOG(DEBUG) << "RpcServer: recv STREAM END for stream " << context.request_id << " " << context.stream_id;
+            session->context_channel.close();
+            co_return;
+        }
+
+        session->recv_stream_id = context.stream_id;
+        session->context_channel.push(std::move(context));
+        co_return;
+    }
+
+    Task<void> sessionRecvLoop(const RpcStreamHandler& handler, std::shared_ptr<RpcSession> session) {
+        std::shared_ptr<ISocket> socket = nullptr;
+        if (auto channel = session->channel.lock()) {
+            socket = channel->socket.lock();
+        } else {
+            LOG(ERR) << "Rpc Server: bad socket";
+        }
+
+        auto context2StringStream = [session]() -> AsyncGenerator<std::string> {
+            while (auto s = co_await session->inChannel->next()) {
+                co_yield *s;
+            }
+        };
+
+        session->inChannel = std::make_unique<Channel<std::string>>();
+        session->outGenerator = std::make_unique<AsyncGenerator<std::string>>(
+            handler(context2StringStream())
+        );
+
+        socket->getContext()->postCoroutineTask(socket,
+            [this, session]() -> Task<void> {
+                co_await sessionSendLoop(*session, *(session->outGenerator));
+                // 这里销毁了 std::shared_ptr<RpcSession>, 写关闭的时候销毁 session, 和 sessionLoop
+                session->context_channel.close();        // 服务端写完了也会关闭读通道，这个时候客户端再写会收到 BAD_STREAM_ID
+                if (auto channel = session->channel.lock()) {
+                    channel->sessions_.erase(session->request_id);
+                }
+        });
+
+        while (std::optional<RpcContext> context = co_await session->context_channel.next()) {
+            std::string errorResponse;
+            session->inChannel->push(std::move(context->params)); // push 的异常会被抛出到 sessionSendLoop
+        }
+        session->inChannel->close();
+        LOG(DEBUG) << "RpcServer:: dispatch stream complete " << session->request_id;
+    }
+
+    Task<void> sessionSendLoop(RpcSession& session, AsyncGenerator<std::string>& respGenerator) {
+        std::shared_ptr<ISocket> socket = nullptr;
+        if (auto channel = session.channel.lock()) {
+            socket = channel->socket.lock();
+        } else {
+            LOG(ERR) << "Rpc Server: bad socket";
+        }
+
+        std::string errorResponse;
+        try {
+            while (auto s = co_await respGenerator.next()) {
+                LOG(DEBUG) << "RpcServer: Try send stream " << session.request_id << " " << session.send_stream_id + 1;
+                session.send_stream_id += 1;        // 注意这里是服务端维护的自己的 stream_id
+                co_await WriterWaiter{socket,
+                    buildStreamResponse(*s, session.request_id, session.send_stream_id)};
+                LOG(DEBUG) << "RpcServer: stream sent " << session.send_stream_id;
+            }
+        }  catch (RpcBadResponseException& e) {
+            LOG(ERR) << "Rpc server: dispatch error " << e.what();
+            errorResponse = buildErrorResponse(
+                session.request_id,
+                session.send_stream_id + 1,
+                ERR_UNKNOWN_RESPONSE
+            );
+        } catch (RpcBadParamException& e) {
+            // 走到这里应该也是服务端的问题，但是为了确保服务不崩溃，没法通知上层应用，只能打个 log 交给对面处理了
+            LOG(ERR) << "Rpc server: dispatch error " << e.what();
+            errorResponse = buildErrorResponse(
+                session.request_id,
+                session.send_stream_id + 1,
+                ERR_UNKNOWN_PARAM
+            );
+        } catch (...) { // 不知道发生了什么异常
+            auto exptr = std::current_exception();
+            LOG(ERR) << "Rpc server: dispatch error " << session.request_id;
+            errorResponse = buildErrorResponse(
+                session.request_id,
+                session.send_stream_id + 1,
+                ERR_BAD_INTERNAL
+            );
+        }
+        if (!errorResponse.empty()) {
+            co_await WriterWaiter{socket, std::move(errorResponse) };
+        }
+        co_await WriterWaiter{socket, buildStreamEnd(session.request_id, session.send_stream_id + 1)};
     }
 
     // void dispatch(RpcContext&& context, const std::shared_ptr<ISocket>& client) {
@@ -760,17 +953,11 @@ public:
     // }
 
 
-    void run(bool block) {
-        context_->run(block);
-    }
+    void run(bool block) { context_->run(block); }
 
-    void close() {
-        context_->close();
-    }
+    void close() { context_->close(); }
 
-    void save(std::unique_ptr<RpcServiceBase> service) {
-        services_.insert(std::move(service));
-    }
+    void save(std::unique_ptr<RpcServiceBase> service) { services_.insert(std::move(service)); }
 
     void addHandler(const std::string& group, const std::string& name, RpcHandler&& handler) {
         LOG(DEBUG) << "RpcServer:: addHandler " << group << " " << name;
@@ -786,7 +973,6 @@ public:
         using namespace nacos;
         if (socket_->bind(ip, port) &&
             socket_->listen(ISocket::DEFAULT_BACKLOG)) {
-
             server_ip = ip;
             server_port = port;
             try {
@@ -794,7 +980,7 @@ public:
                 props[PropertyKeyConst::SERVER_ADDR] = NACOS_SERVER_ADDRESS;
                 props[PropertyKeyConst::AUTH_PASSWORD] = NACOS_PASSWORD;
                 props[PropertyKeyConst::AUTH_USERNAME] = NACOS_USER_NAME;
-                auto *factory = nacos::NacosFactoryFactory::getNacosFactory(props);
+                auto* factory = nacos::NacosFactoryFactory::getNacosFactory(props);
 
                 ResourceGuard _(factory);
                 NamingService* nameService = factory->CreateNamingService();
@@ -809,48 +995,35 @@ public:
     }
 
     void registerDiscovery(const std::string& name) {
-        try {
-            if (use_nacos) {
-                this->namingService_->registerInstance(name, server_ip, server_port);
-            }
-        } catch (nacos::NacosException& e) {
-            LOG(DEBUG) << "Rpc server: failed to register a server to nacos " << name;
-        }
+        try { if (use_nacos) { this->namingService_->registerInstance(name, server_ip, server_port); } } catch (
+            nacos::NacosException& e) { LOG(DEBUG) << "Rpc server: failed to register a server to nacos " << name; }
     }
 };
 
-void RpcServer::addHandler(const std::string& group, const std::string& name, std::function<std::string(std::string buffer)> func) const {
-    impl->addHandler(group, name, std::move(func));
-}
+void RpcServer::addHandler(
+    const std::string& group,
+    const std::string& name,
+    std::function<std::string(std::string buffer)> func
+) const { impl->addHandler(group, name, std::move(func)); }
 
 void RpcServer::addStreamHandler(
     const std::string& group,
     const std::string& name,
     std::function<AsyncGenerator<std::string>(AsyncGenerator<std::string> bufferStream)> func
-) const {
-    impl->addStreamHandler(group, name, std::move(func));
-}
+) const { impl->addStreamHandler(group, name, std::move(func)); }
 
 void RpcServer::registerService(std::unique_ptr<RpcServiceBase> service) {
     service->setup(*this);
     impl->save(std::move(service));
 }
 
-void RpcServer::run(bool block) {
-    impl->run(block);
-}
-void RpcServer::close() {
-    impl->close();
-}
+void RpcServer::run(bool block) { impl->run(block); }
+void RpcServer::close() { impl->close(); }
 
-bool RpcServer::bindAndListen(const char* ip, short port) {
-    return impl->bindAndListen(ip, port);
-}
+bool RpcServer::bindAndListen(const char* ip, short port) { return impl->bindAndListen(ip, port); }
 
-void RpcServer::registerServiceName(const std::string& name) {
-    impl->registerDiscovery(name);
-}
+void RpcServer::registerServiceName(const std::string& name) { impl->registerDiscovery(name); }
 
-RpcServer::RpcServer() : impl(std::make_unique<RpcServerImpl>()){}
+RpcServer::RpcServer() : impl(std::make_unique<RpcServerImpl>()) {}
 
 RpcServer::~RpcServer() = default;

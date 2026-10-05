@@ -16,29 +16,29 @@ struct Hello : RpcService<Hello> {
 
     HelloWorldResponse hello(HelloWorldRequest req) {
         HelloWorldResponse resp;
-        if (req.msg() == "hello") {
-            resp.set_res("world");
-        } else {
-            resp.set_res(req.msg());
-        }
+        resp.set_res(req.msg());
 
         return resp;
     }
 
     AsyncGenerator<HelloWorldResponse> helloStream(AsyncGenerator<HelloWorldRequest> req) {
         while (auto r = co_await req.next()) {
+            LOG(DEBUG) << "recv hello stream: " << r->msg();
             HelloWorldResponse resp;
             resp.set_res(r->msg());
             co_yield resp;
         }
+
+        LOG(DEBUG) << "recv hello stream end";
     }
 };
 
 int main() {
-    Logger::getInstance().set_log_level(WARNING);
+    Logger::getInstance().set_log_level(DEBUG);
     RpcServer server;
     if (!server.bindAndListen("127.0.0.1", 8891)) {
         std::cout << "bind failed" << std::endl;
+        return 0;
     }
     std::cout << "bind at 127.0.0.1:8891" << std::endl;
     server.registerService(Hello::create());

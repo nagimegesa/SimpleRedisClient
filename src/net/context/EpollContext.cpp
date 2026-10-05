@@ -146,6 +146,23 @@ public:
         }
     }
 
+    void postCoroutineTask(std::function<Task<void>()> function) {
+        postTask([this, function = std::move(function)]() {
+            std::size_t id = ++coroutineId; // 这里假设 id 不会循环, 即使循环了，前面的 task 应该也删除了
+            auto task = function();
+            task.registerTaskCloseCallback([this, id]() {
+                this->postTask([this, id]() {
+                    LOG(DEBUG) << "EpollContext:: close coroutine " << id;
+                    coroutines.erase(id);
+                });
+            });
+            task.start();
+            coroutines.emplace(id, std::make_unique<Task<void>>(std::move(task)));
+
+            LOG(DEBUG) << "EpollContext: start coroutine " << id;
+        });
+    }
+
     ISocket::SocketHandler addTimer(std::chrono::milliseconds ms, std::function<void()> cb) {
         int timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
         if (timerfd < 0) {
@@ -183,6 +200,8 @@ public:
 
         return timerfd;
     }
+
+
 
 private:
     void run() {
@@ -707,6 +726,8 @@ private:
     // std::mutex task_mutex_;                                            // 保护任务队列
     MPSCQueue<std::function<void()>, 512> task_queue_;
 
+    std::size_t coroutineId = 0;
+    std::unordered_map<std::size_t, std::unique_ptr<Task<void>>> coroutines;
 
     constexpr static int MAX_EVENTS = 2048;
     friend EpollContextImpl;
@@ -956,6 +977,13 @@ public:
         }
     }
 
+    void postCoroutineTask(const std::shared_ptr<ISocket>& socket, const std::function<Task<void>()>& function) {
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
+            loops_[index]->postCoroutineTask(function);
+        }
+    }
+
     ISocket::SocketHandler addTimer(const std::shared_ptr<ISocket>& socket, std::chrono::milliseconds duration, const std::function<void()>& callback) {
         if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
             return addTimer(fd, duration, callback);
@@ -1037,6 +1065,13 @@ void EpollContext::registerCloseCallback(
 
 void EpollContext::postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const {
     impl->postTask(socket, function);
+}
+
+void EpollContext::postCoroutineTask(
+    const std::shared_ptr<ISocket>& socket,
+    const std::function<Task<void>()>& function
+) const {
+    impl->postCoroutineTask(socket, function);
 }
 
 ISocket::SocketHandler EpollContext::addTimer(

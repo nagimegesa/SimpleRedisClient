@@ -1,4 +1,4 @@
-file(GLOB_RECURSE NET_SOURCES "context/*.cpp" "socket/*.cpp")
+file(GLOB_RECURSE NET_SOURCES CONFIGURE_DEPENDS "context/*.cpp" "socket/*.cpp")
 
 find_library(TCMALLOC_LIB tcmalloc REQUIRED PATHS /usr/bin/lib)
 
@@ -10,5 +10,9 @@ endif()
 
 add_library(net STATIC ${NET_SOURCES})
 target_link_libraries(net utils ${TCMALLOC_LIB} pthread)
+
+if (${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
+    target_compile_options(net PRIVATE -fcoroutines)
+endif ()
 
 target_include_directories(net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

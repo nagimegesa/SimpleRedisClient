@@ -1,38 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RPC 客户端冒烟测试
+RPC 客户端冒烟测试（新协议）
 
-请求协议:
+帧布局:
   0x0a 0x0b
-  type          (1 字节)  1 = REQUEST
-  request_id    (8 字节, 大端, 无符号, 不能为 0)
-  error_code    (1 字节)  client 发送时固定 0
-  service_len   (1 字节)
+  type          (1)  1=REQ 2=RESP 3=STREAM_REQ 4=STREAM_RESP 5=STREAM_END 255=ERROR
+  request_id    (8, BE, u64, 非 0)
+  stream_id     (8, BE, u64; 非流式=0, 流式非 0)
+  error_code    (1)
+  service_len   (1)
+  func_len      (1)
+  param_len     (2, BE)
   service_name
-  func_len      (1 字节)
   func_name
-  param_len     (4 字节, 大端)
-  serialized param
+  body
   0x0b 0x0c
-
-响应协议:
-  成功:
-    0x0a 0x0b
-    type        (1 字节)  2 = RESPONSE
-    request_id  (8 字节, 大端)
-    error_code  (1 字节)  固定 0
-    param_len   (4 字节, 大端)
-    serialized body
-    0x0b 0x0c
-
-  错误:
-    0x0a 0x0b
-    type        (1 字节)  3 = ERROR
-    request_id  (8 字节, 大端)
-    error_code  (1 字节)
-    param_len   (4 字节, 大端) 固定 0
-    0x0b 0x0c
+总长 = 26 + service_len + func_len + param_len
 """
 
 import itertools
@@ -53,84 +37,80 @@ PORT = 8891
 START = b"\x0a\x0b"
 END = b"\x0b\x0c"
 
-REQUEST_TYPE = 1
-RESPONSE_TYPE = 2
-ERROR_TYPE = 3
+REQUEST_TYPE         = 1
+RESPONSE_TYPE        = 2
+STREAM_REQUEST_TYPE  = 3
+STREAM_RESPONSE_TYPE = 4
+STREAM_END_TYPE      = 5
+ERROR_TYPE           = 255
 
 REQUEST_ID_FMT = ">Q"
-PARAM_LEN_FMT = ">I"
+STREAM_ID_FMT  = ">Q"
+PARAM_LEN_FMT  = ">H"
 
-# 等第一个响应字节的超时
 FIRST_TIMEOUT = 5.0
-
-# 接收缓冲区大小
 RECV_SIZE = 65536
-
 DEBUG_RAW = False
 
-# 默认 service 名（新协议里多了一层 service）
 DEFAULT_SERVICE = "HelloService"
 
 ERROR_NAMES = {
-    1: "ERR_BAD_REQUEST",
-    3: "ERR_BAD_INTERNAL",
+    0:   "ERR_BAD_INTERNAL",
+    1:   "ERR_BAD_REQUEST",
+    2:   "ERR_BAD_STREAM_ID",
     100: "ERR_UNKNOWN_FUNCTION",
     101: "ERR_UNKNOWN_PARAM",
     102: "ERR_UNKNOWN_RESPONSE",
 }
 
-
 _id_counter = itertools.count(1)
 
 
 def next_request_id() -> int:
-    """生成非 0 的 u64 request_id。"""
     while True:
         rid = next(_id_counter) & 0xFFFFFFFFFFFFFFFF
         if rid != 0:
             return rid
 
 
-# ---------------------- 请求打包 ----------------------
+# ---------------------- 打包 ----------------------
 
-def build_packet(
-        service_name: str,
-        func_name: str,
-        request,
-        request_id: int = None,
-) -> bytes:
+def build_packet(service_name, func_name, request, request_id=None,
+                 stream_id=0, msg_type=REQUEST_TYPE) -> bytes:
+    """
+    request 为 None 时表示空 body（用于 STREAM_END）。
+    """
     if request_id is None:
         request_id = next_request_id()
 
-    assert 0 < request_id <= 0xFFFFFFFFFFFFFFFF, "request_id must be non-zero u64"
+    assert 0 < request_id <= 0xFFFFFFFFFFFFFFFF
+    assert 0 <= stream_id <= 0xFFFFFFFFFFFFFFFF
 
     svc_b = service_name.encode("utf-8")
     func_b = func_name.encode("utf-8")
-    param_b = request.SerializeToString()
+    param_b = b"" if request is None else request.SerializeToString()
 
-    assert len(svc_b) <= 0xFF, "service name too long"
-    assert len(func_b) <= 0xFF, "function name too long"
+    assert len(svc_b) <= 0xFF
+    assert len(func_b) <= 0xFF
+    assert len(param_b) <= 0xFFFF, "param too long for u16"
 
     pkt = bytearray()
     pkt += START
-    pkt.append(REQUEST_TYPE)                          # type (1B)
-    pkt += struct.pack(REQUEST_ID_FMT, request_id)    # request_id (8B, BE)
-    pkt.append(0)                                     # error_code (1B) = 0
-    pkt.append(len(svc_b))                            # service_len (1B)
-    pkt += svc_b                                      # service_name
-    pkt.append(len(func_b))                           # func_len (1B)
-    pkt += func_b                                     # function name
-    pkt += struct.pack(PARAM_LEN_FMT, len(param_b))   # param_len (4B, BE)
-    pkt += param_b                                    # serialized param
+    pkt.append(msg_type)
+    pkt += struct.pack(REQUEST_ID_FMT, request_id)
+    pkt += struct.pack(STREAM_ID_FMT, stream_id)
+    pkt.append(0)                             # error_code
+    pkt.append(len(svc_b))
+    pkt.append(len(func_b))
+    pkt += struct.pack(PARAM_LEN_FMT, len(param_b))
+    pkt += svc_b
+    pkt += func_b
+    pkt += param_b
     pkt += END
-
     return bytes(pkt)
 
 
-# extra:
-#   RESPONSE_TYPE -> error_code (固定 0)
-#   ERROR_TYPE    -> error_code
-Frame = namedtuple("Frame", ["type", "request_id", "body", "extra"])
+Frame = namedtuple("Frame", ["type", "request_id", "stream_id", "body", "extra"])
 
 
 class RpcError(Exception):
@@ -141,46 +121,24 @@ class RpcError(Exception):
 
 
 class RpcClient:
-    def __init__(
-            self,
-            host=HOST,
-            port=PORT,
-            first_timeout=FIRST_TIMEOUT,
-    ):
+    def __init__(self, host=HOST, port=PORT, first_timeout=FIRST_TIMEOUT):
         self.first_timeout = first_timeout
         self.sock = socket.create_connection((host, port), timeout=first_timeout)
-
-        # 长连接接收缓冲区，可能包含多个帧或半帧
         self._buf = bytearray()
-
-        # 已经收到但暂时不匹配的响应帧，按 request_id 缓存
         self._pending = {}
 
     def _try_parse_frame(self):
-        """
-        尝试从 self._buf 中解析一个完整响应帧。
-        解析成功则消费缓冲区并返回 Frame；数据不足返回 None。
-
-        帧布局:
-          START(2) | type(1) | request_id(8) | error_code(1) |
-          param_len(4) | body(param_len) | END(2)
-        固定头部 16 字节，帧总长 18 + param_len。
-        """
         buf = self._buf
-
         if len(buf) < 2:
             return None
 
-        # 同步到 START
         pos = buf.find(START)
         if pos < 0:
-            # 保留最后一个字节，可能是 START 的前半部分 0x0a
             if buf and buf[-1] == 0x0a:
                 del buf[:-1]
             else:
                 buf.clear()
             return None
-
         if pos > 0:
             del buf[:pos]
 
@@ -188,40 +146,37 @@ class RpcClient:
             return None
 
         frame_type = buf[2]
-
-        # 客户端只接受 RESPONSE / ERROR
-        if frame_type not in (RESPONSE_TYPE, ERROR_TYPE):
+        if frame_type not in (RESPONSE_TYPE, STREAM_RESPONSE_TYPE,
+                              STREAM_END_TYPE, ERROR_TYPE):
             del buf[0]
             return None
 
-        # start(2) + type(1) + request_id(8) + error_code(1) + param_len(4)
-        if len(buf) < 16:
+        if len(buf) < 24:
             return None
 
-        request_id = struct.unpack(">Q", buf[3:11])[0]
-        error_code = buf[11]
-        param_len = struct.unpack(">I", buf[12:16])[0]
+        request_id  = struct.unpack(">Q", buf[3:11])[0]
+        stream_id   = struct.unpack(">Q", buf[11:19])[0]
+        error_code  = buf[19]
+        service_len = buf[20]
+        func_len    = buf[21]
+        param_len   = struct.unpack(">H", buf[22:24])[0]
 
-        # 成功帧和错误帧长度都是 18 + param_len
-        total = 18 + param_len
+        total = 26 + service_len + func_len + param_len
         if len(buf) < total:
             return None
 
-        body = bytes(buf[16:16 + param_len])
+        body_start = 24 + service_len + func_len
+        body = bytes(buf[body_start:body_start + param_len])
 
-        if bytes(buf[16 + param_len:18 + param_len]) != END:
-            # 帧尾不合法，丢弃 START 重新同步
+        end_start = body_start + param_len
+        if bytes(buf[end_start:end_start + 2]) != END:
             del buf[:2]
             return None
 
         del buf[:total]
-        return Frame(frame_type, request_id, body, error_code)
+        return Frame(frame_type, request_id, stream_id, body, error_code)
 
     def _recv_frame(self, expect_request_id: int) -> Frame:
-        """
-        读取并返回指定 request_id 的完整响应帧。
-        如果先收到其它 request_id 的帧，会缓存起来。
-        """
         if expect_request_id in self._pending:
             return self._pending.pop(expect_request_id)
 
@@ -232,56 +187,83 @@ class RpcClient:
             if frame is not None:
                 if frame.request_id == expect_request_id:
                     return frame
-
                 self._pending[frame.request_id] = frame
                 continue
 
             try:
                 chunk = self.sock.recv(RECV_SIZE)
             except socket.timeout:
-                raise TimeoutError(
-                    f"等待响应超时: request_id={expect_request_id}"
-                )
+                raise TimeoutError(f"等待响应超时: request_id={expect_request_id}")
 
             if not chunk:
                 raise ConnectionError("server closed connection")
 
             if DEBUG_RAW:
                 print(f"  [raw] recv {chunk.hex(' ')}")
-
             self._buf.extend(chunk)
 
-    def call(
-            self,
-            func_name: str,
-            request,
-            request_id: int = None,
-            service_name: str = DEFAULT_SERVICE,
-    ):
+    # ---------- 一元 ----------
+
+    def call(self, func_name, request, request_id=None,
+             service_name=DEFAULT_SERVICE):
         if request_id is None:
             request_id = next_request_id()
 
-        pkt = build_packet(
-            service_name=service_name,
-            func_name=func_name,
-            request=request,
-            request_id=request_id,
-        )
+        pkt = build_packet(service_name, func_name, request, request_id,
+                           stream_id=0, msg_type=REQUEST_TYPE)
         self.sock.sendall(pkt)
 
         frame = self._recv_frame(request_id)
 
         if frame.type == ERROR_TYPE:
             raise RpcError(frame.extra)
-
-        # frame.type == RESPONSE_TYPE
-        # error_code 字段固定为 0；若不是，说明协议异常
+        if frame.type != RESPONSE_TYPE:
+            raise RpcError(102)
         if frame.extra != 0:
             raise RpcError(frame.extra)
 
         resp = hello_pb2.HelloWorldResponse()
         resp.ParseFromString(frame.body)
         return resp
+
+    # ---------- 流式 ----------
+
+    def call_stream(self, func_name, request, request_id=None,
+                    service_name=DEFAULT_SERVICE):
+        """
+        发送:
+          STREAM_REQUEST (stream_id=1) 带 protobuf body
+          STREAM_END     (stream_id=2) 空 body —— 通知服务端输入结束
+        接收:
+          逐块 yield STREAM_RESPONSE 的 protobuf body (bytes)
+          收到 STREAM_END 停止
+          收到 ERROR 抛 RpcError
+        """
+        if request_id is None:
+            request_id = next_request_id()
+
+        pkt = build_packet(service_name, func_name, request, request_id,
+                           stream_id=1, msg_type=STREAM_REQUEST_TYPE)
+        self.sock.sendall(pkt)
+
+        end_pkt = build_packet(service_name, func_name, None, request_id,
+                               stream_id=2, msg_type=STREAM_END_TYPE)
+        self.sock.sendall(end_pkt)
+
+        while True:
+            frame = self._recv_frame(request_id)
+
+            if frame.type == ERROR_TYPE:
+                raise RpcError(frame.extra)
+
+            if frame.type == STREAM_END_TYPE:
+                return
+
+            if frame.type == STREAM_RESPONSE_TYPE:
+                yield frame.body
+                continue
+
+            raise RpcError(102)
 
     def close(self):
         try:
@@ -296,51 +278,69 @@ class RpcClient:
         self.close()
 
 
-def check(client: RpcClient, name: str, req_msg: str, expect: str,
-          service_name: str = DEFAULT_SERVICE, func_name: str = "hello"):
+# ---------------------- 测试用例 ----------------------
+
+def check(client, name, req_msg, expect,
+          service_name=DEFAULT_SERVICE, func_name="hello"):
     req = hello_pb2.HelloWorldRequest()
     req.msg = req_msg
-
     resp = client.call(func_name, req, service_name=service_name)
-
     ok = resp.res == expect
-    flag = "PASS" if ok else "FAIL"
-    print(f"[{flag}] {name}: msg={req_msg!r} -> res={resp.res!r} (expect {expect!r})")
-    assert ok, f"{name} failed"
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}: {req_msg!r} -> {resp.res!r} (expect {expect!r})")
+    assert ok
 
 
-def check_error(
-        client: RpcClient,
-        name: str,
-        func_name: str,
-        req_msg: str,
-        expect_code: int,
-        service_name: str = DEFAULT_SERVICE,
-):
+def check_error(client, name, func_name, req_msg, expect_code,
+                service_name=DEFAULT_SERVICE):
     req = hello_pb2.HelloWorldRequest()
     req.msg = req_msg
-
     try:
         client.call(func_name, req, service_name=service_name)
     except RpcError as e:
         ok = e.code == expect_code
-        flag = "PASS" if ok else "FAIL"
-        print(f"[{flag}] {name}: error_code={e.code} (expect {expect_code})")
-        assert ok, f"{name} failed"
+        print(f"[{'PASS' if ok else 'FAIL'}] {name}: error_code={e.code} (expect {expect_code})")
+        assert ok
     else:
-        print(f"[FAIL] {name}: expected RpcError({expect_code}), but call succeeded")
-        assert False, f"{name} failed"
+        print(f"[FAIL] {name}: expected RpcError({expect_code}), got success")
+        assert False
+
+
+def check_stream(client, name, func_name, req_msg, expect_resps,
+                 service_name=DEFAULT_SERVICE):
+    """
+    expect_resps: list[str]，每个 STREAM_RESPONSE body 解出来的 HelloWorldResponse.res
+    """
+    req = hello_pb2.HelloWorldRequest()
+    req.msg = req_msg
+
+    chunks = list(client.call_stream(func_name, req, service_name=service_name))
+
+    got = []
+    for c in chunks:
+        resp = hello_pb2.HelloWorldResponse()
+        resp.ParseFromString(c)
+        got.append(resp.res)
+
+    ok = got == expect_resps
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}: got {got} (expect {expect_resps})")
+    assert ok
 
 
 def main() -> int:
     with RpcClient() as client:
-        check(client, "hello -> world", "hello", "world")
+        # 一元
+        check(client, "hello", "hello", "hello")
         check(client, "echo ping",      "ping",  "ping")
         check(client, "echo empty",     "",      "")
         check(client, "echo utf8",      "你好",  "你好")
         check(client, "echo long",      "a" * 10, "a" * 10)
-
         check_error(client, "unknown function", "no_such_function", "x", 100)
+
+        # 流式: helloStream 对每个输入 echo 一个 HelloWorldResponse
+        check_stream(client, "stream echo hello", "helloStream", "hello", ["hello"])
+        check_stream(client, "stream echo ping",  "helloStream", "ping",  ["ping"])
+        check_stream(client, "stream echo empty", "helloStream", "",      [""])
+        check_stream(client, "stream echo utf8",  "helloStream", "你好",  ["你好"])
 
     return 0
 

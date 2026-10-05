@@ -35,10 +35,14 @@ struct WriterWaiter {
     bool await_ready() { return false; }
     WriterWaiter(std::shared_ptr<ISocket> socket, std::string&& data) : socket(std::move(socket)), data(std::move(data)) {}
     void await_suspend(std::coroutine_handle<> h) {
-        socket->asyncWriteOnce([this, h](bool success) {
-            this->writeResult = success;
+        if (socket) {
+            socket->asyncWriteOnce([this, h](bool success) {
+                this->writeResult = success;
+                h.resume();
+            }, std::move(data));
+        } else {
             h.resume();
-        }, std::move(data));
+        }
     }
 
     bool await_resume() const noexcept {
@@ -77,7 +81,7 @@ struct ThreadPoolWaiter {
         }, std::move(func));
     }
 
-    T await_resume() const {
+    T await_resume() {
         if (exception) std::rethrow_exception(exception);
         return std::move(*result);
     }

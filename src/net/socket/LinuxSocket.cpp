@@ -239,6 +239,11 @@ void LinuxSocket::setNoBlock() {
     if (setsockopt(socket_fd,SOL_SOCKET, SO_REUSEADDR, &enable,sizeof(enable)) < 0) {
         LOG(ERR) << "setsockopt SO_REUSEADDR failed";
     }
+
+    // 快速关闭
+    if (setsockopt(socket_fd,SOL_SOCKET, SO_REUSEPORT, &enable,sizeof(enable)) < 0) {
+        LOG(ERR) << "setsockopt SO_REUSEADDR failed";
+    }
 }
 
 ISocket::SocketHandler LinuxSocket::getNative() const {

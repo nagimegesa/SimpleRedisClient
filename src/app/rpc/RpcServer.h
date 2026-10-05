@@ -6,7 +6,6 @@
 #define DEMO_RPCSERVER_H
 
 #include <functional>
-#include <functional>
 #include <memory>
 #include <string>
 #include <google/protobuf/message.h>
@@ -28,16 +27,14 @@
  *         return response;
  *     }
  *
- *     void helloStream(HelloWorldRequest request, const RpcWriter& writer) {
- *          for(int i : request) {
+ *     AsyncGenerator<HelloWorldResponse> helloStream(AsyncGenerator<HelloWorldRequest> request) {
+ *          while(auto req = co_await request.next()) {
  *              HelloWorldResponse res;
- *              res.set_res("world");
+ *              res.set_res(req->msg());
  *              for(int i = 0; i < 4; ++i) {
- *                  co_return xxx;
+ *                  co_yield res;
  *              }
  *          }
- *
- *          return nullptr;
  *     }
  * }
  *
@@ -74,16 +71,6 @@ public:
     void registerServiceName(const std::string& name);
     RpcServer();
     ~RpcServer();
-
-    class RpcWriter {
-        struct Impl;
-        std::unique_ptr<Impl> impl;
-    public:
-        bool write(::google::protobuf::Message& message) const;
-        RpcWriter();
-        ~RpcWriter() = default;
-        friend RpcServerImpl;
-    };
 };
 
 using RpcWriter = RpcServer::RpcWriter;
@@ -183,7 +170,7 @@ struct RpcService : RpcServiceBase {
                                 }
         );
     }
-
+    
     template <typename T>  requires std::is_base_of_v<::google::protobuf::Message, T>
     AsyncGenerator<T> stringStream2T(AsyncGenerator<std::string> stringStream) {
         while (auto n = co_await stringStream.next()) {
