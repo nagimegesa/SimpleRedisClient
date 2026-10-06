@@ -1,9 +1,11 @@
 #include "Logger.h"
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <thread>
 #include <atomic>
 
@@ -15,6 +17,11 @@ public:
         // queue.enqueue(std::move(str));
         // 不断写直到成功
         while (!queue.push(std::move(str))) {}
+
+        // 消费者是持锁判断队列为空后才 wait 的，这里先抢一次锁再 notify，
+        // 保证 notify 不会发生在 wait 之前。
+        { std::lock_guard<std::mutex> lock(mutex_); }
+        cv_.notify_one();
     }
 
     void set_log_file(const char* file, bool create) {
@@ -33,7 +40,12 @@ public:
     }
 
     void close() {
-        closed = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed = true;
+        }
+        cv_.notify_all();
+
         if (writer_thread.joinable()) {
             writer_thread.join();
         }
@@ -54,32 +66,24 @@ private:
 
     void write_log() {
         std::string logs;
+        std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
-            while (queue.pop(logs)) {
+            if (queue.pop(logs)) {
+                lock.unlock();          // 输出/落盘期间不持锁
                 std::cout << logs;
                 if (this->stream_.is_open()) {
                     this->stream_ << logs;
                 }
+                lock.lock();
+                continue;
             }
 
             if (closed && queue.empty()) {
                 break;
             }
 
-            // 没有日志直接退让， 盲目退让 开销很大，十分不稳定
-            // std::this_thread::yield();
-
-            // if (!queue.empty()) {
-            //     std::string logs;
-            //     queue.dequeue(&logs);
-            //     std::cout << logs;
-            //     if (this->stream_) {
-            //         this->stream_ << logs;
-            //     }
-            // }
-            // if (closed && queue.size() == 0) {
-            //     break;
-            // }
+            // 没有日志就阻塞等待，不要空转：
+            cv_.wait(lock, [this] { return closed.load() || !queue.empty(); });
         }
     }
 
@@ -91,13 +95,18 @@ private:
 
     std::atomic<bool> closed = false;
     std::ofstream stream_;
+
+    std::mutex              mutex_;   // 保护「队列空判断 + 等待」，兼作丢唤醒屏障
+    std::condition_variable cv_;      // 队列非空 / closed 时唤醒写线程
 };
 
 // ----- LogEntry 实现 -----
 LogEntry::LogEntry(LoggerWriter* writer, const char* file, int line, LogLevel level)
     : writer_(writer), level_(level) {
 
-    if (level_ >= Logger::getInstance().get_log_level()) {
+    enabled_ = (writer_ != nullptr) && (level_ >= Logger::getInstance().get_log_level());
+
+    if (enabled_) {
         // 1. 开头先写时间戳
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
@@ -117,7 +126,7 @@ LogEntry::LogEntry(LoggerWriter* writer, const char* file, int line, LogLevel le
 
 LogEntry::~LogEntry() {
     // 析构时：自动追加换行符，然后把整条内容交给 Writer
-    if (writer_ && level_ >= Logger::getInstance().get_log_level()) {
+    if (enabled_) {
         stream_ << "\n";
         writer_->write(stream_.str());
     }

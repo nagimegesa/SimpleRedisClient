@@ -2,9 +2,6 @@
 #define LOGGER_WRITER_HPP_
 
 #include <sstream>
-#include <string>
-
-// TODO: 这里可以使用无锁队列，但是太复杂，先不搞
 
 class LoggerWriter;
 
@@ -21,14 +18,20 @@ public:
     ~LogEntry();
 
     // 模板流式操作：把内容塞进内部的 ostringstream
+    // 低于当前日志级别时直接丢弃，不拼字符串、不分配 —— 否则被过滤掉的日志
+    // （热路径上大量 LOG(DEBUG)）依旧会为每条日志做一次完整格式化
     template<typename T>
     LogEntry& operator<<(const T& val) {
-        stream_ << val;
+        if (enabled_) {
+            stream_ << val;
+        }
         return *this;
     }
 
-    LogEntry&  operator<<(std::ostream& (*manip)(std::ostream&)) {
-        stream_ << manip;
+    LogEntry& operator<<(std::ostream& (*manip)(std::ostream&)) {
+        if (enabled_) {
+            stream_ << manip;
+        }
         return *this;
     }
 
@@ -39,6 +42,7 @@ private:
     std::ostringstream stream_;
     LoggerWriter* writer_;
     LogLevel level_;
+    bool enabled_ = false;   // 本条日志是否达到当前日志级别
 };
 
 class Logger {
@@ -49,7 +53,6 @@ public:
     void set_log_file(const char* file, bool create=true);
     void set_log_level(LogLevel level);
     LogLevel get_log_level() { return level_; }
-
 
     static Logger& getInstance();
 

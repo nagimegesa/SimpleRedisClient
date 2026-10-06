@@ -121,14 +121,13 @@ struct TaskPromiseBase {
             std::coroutine_handle<Promise> h) const noexcept {
             auto& promise = h.promise();
 
+            auto con = promise.continuation;
+            promise.continuation = nullptr;
+            promise.closed = true;
             if (promise.onTaskClosed) {
                 promise.onTaskClosed();
             }
-            promise.closed = true;
-
-            return promise.continuation
-                ? promise.continuation
-                : std::noop_coroutine();
+            return con ? con: std::noop_coroutine();
         }
 
         void await_resume() const noexcept {}

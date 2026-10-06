@@ -84,7 +84,7 @@ Bye.
 ./cmake-build-release/rpc_server
 
 # 另开终端运行协议冒烟测试
-python3 test/test_rpc/rpc_client.py
+python3 test/test_rpc/test_rpc_client.py
 ```
 
 ---

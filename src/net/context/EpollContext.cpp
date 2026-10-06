@@ -52,6 +52,8 @@ struct Connection {
     bool read_registered = false;             // 是否已注册 EPOLLIN
     bool write_registered = false;            // 是否已注册 EPOLLOUT
     bool peer_closed_ = false;                // 对端是否已关闭写端（收到 FIN）
+    bool closing = false;
+
     Connection(std::shared_ptr<ISocket> s, ReadContextCallBack cb)
         : socket(std::move(s)), read_cb(std::move(cb)) {
         read_buffer.resize(DEFAULT_BUFFER_SIZE);
@@ -144,23 +146,6 @@ public:
             uint64_t one = 1;
             ::write(wakeup_fd_, &one, sizeof(one));
         }
-    }
-
-    void postCoroutineTask(std::function<Task<void>()> function) {
-        postTask([this, function = std::move(function)]() {
-            std::size_t id = ++coroutineId; // 这里假设 id 不会循环, 即使循环了，前面的 task 应该也删除了
-            auto task = function();
-            task.registerTaskCloseCallback([this, id]() {
-                this->postTask([this, id]() {
-                    LOG(DEBUG) << "EpollContext:: close coroutine " << id;
-                    coroutines.erase(id);
-                });
-            });
-            task.start();
-            coroutines.emplace(id, std::make_unique<Task<void>>(std::move(task)));
-
-            LOG(DEBUG) << "EpollContext: start coroutine " << id;
-        });
     }
 
     ISocket::SocketHandler addTimer(std::chrono::milliseconds ms, std::function<void()> cb) {
@@ -277,6 +262,10 @@ private:
     void handleAccept(int fd) const {
         auto& context = accept_socket_set_.find(fd)->second;
         auto client = context->socket->accept();
+        if (client == nullptr) {
+            LOG(ERR) << "EpollContext::handleAccept: accept failed";
+            return;
+        }
         if (context->accept_cb) {
             context->accept_cb(client);
         }
@@ -514,16 +503,17 @@ private:
         auto it = connections_.find(fd);
         if (it == connections_.end()) return;
         auto conn = it->second; // 拷贝 shared_ptr 以便在 map 外使用
+        conn->closing = true;
 
         if (conn->closing_callback) {
             conn->closing_callback(conn->socket);
         }
 
-        // 从 map 中移除
-        connections_.erase(it);
-
         // 通知所有待写请求失败
         failAllPendingWrites(conn);
+
+        // 从 map 中移除, 这里可能会触发socket 析构，或者 conn 里面还有数据没写完，所以放在最后
+        connections_.erase(it);
     }
 
     void modifyEpollEvents(int fd, uint32_t events) {
@@ -574,6 +564,11 @@ public:
 
         // 新建连接
         auto conn = std::make_shared<Connection>(socket, callback);
+        if (socket != conn->socket) {
+            LOG(WARNING) << "EventLoopThread: connection is closing, read failed";
+            return;
+        }
+
         conn->read_registered = true;
         connections_[fd] = conn;
 
@@ -591,21 +586,35 @@ public:
         // 如果连接不存在，则创建一个只写连接
         auto it = connections_.find(fd);
         if (it == connections_.end()) {
-            auto conn = std::make_shared<Connection>(std::move(socket), nullptr);
-            conn->write_registered = true;
-            connections_[fd] = conn;
-
-            epoll_event ev{};
-            ev.events = EPOLLOUT;
-            ev.data.fd = fd;
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
-
-            it = connections_.find(fd); // 重新获取
+            LOG(WARNING) << "EventLoopThread: no connection found for fd " << fd;
+            if (callback) {
+                callback(false);
+            }
+            return;
+            // auto conn = std::make_shared<Connection>(std::move(socket), nullptr);
+            // conn->write_registered = true;
+            // connections_[fd] = conn;
+            //
+            // epoll_event ev{};
+            // ev.events = EPOLLOUT;
+            // ev.data.fd = fd;
+            // ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
+            //
+            // it = connections_.find(fd); // 重新获取
         }
 
         // 这里可以使用 & 是因为 不可能出现 conn 被移除的情况
         // 因为 removeSocket 不可能在这个函数内被调用
         auto& conn = it->second;
+
+        if (conn->closing || conn->socket != socket) {
+            LOG(WARNING) << "EventLoopThread: connection is closing, write failed";
+            if (callback) {
+                callback(false);
+            }
+            return;
+        }
+
         int size = static_cast<int>(buf.size());
         // conn->write_queue.emplace_back(socket, callback, buf);
         conn->write_queue.emplace_back(std::move(callback), std::move(buf));
@@ -635,19 +644,32 @@ public:
 
         auto it = connections_.find(fd);
         if (it == connections_.end()) {
-            auto conn = std::make_shared<Connection>(std::move(socket), nullptr);
-            conn->write_registered = true;
-            connections_[fd] = conn;
-
-            epoll_event ev{};
-            ev.events = EPOLLOUT;
-            ev.data.fd = fd;
-            ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
-
-            it = connections_.find(fd);
+            LOG(WARNING) << "EventLoopThread: no connection found for fd " << fd;
+            if (callbacks) {
+                callbacks(false, -1);
+            }
+            return;
+            // auto conn = std::make_shared<Connection>(std::move(socket), nullptr);
+            // conn->write_registered = true;
+            // connections_[fd] = conn;
+            //
+            // epoll_event ev{};
+            // ev.events = EPOLLOUT;
+            // ev.data.fd = fd;
+            // ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
+            //
+            // it = connections_.find(fd);
         }
 
         auto& conn = it->second;
+
+        if (conn->closing || conn->socket != socket) {
+            LOG(WARNING) << "EventLoopThread: connection is closing, write failed";
+            if (callbacks) {
+                callbacks(false, -1);
+            }
+            return;
+        }
 
         for (int i = 0; i < bufs.size(); ++i) {
             conn->in_queue_write_buffer_byte_size += static_cast<int>(bufs[i].size());
@@ -727,7 +749,6 @@ private:
     MPSCQueue<std::function<void()>, 512> task_queue_;
 
     std::size_t coroutineId = 0;
-    std::unordered_map<std::size_t, std::unique_ptr<Task<void>>> coroutines;
 
     constexpr static int MAX_EVENTS = 2048;
     friend EpollContextImpl;
@@ -977,13 +998,6 @@ public:
         }
     }
 
-    void postCoroutineTask(const std::shared_ptr<ISocket>& socket, const std::function<Task<void>()>& function) {
-        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
-            std::size_t index = std::hash<int>{}(fd) % loops_.size();
-            loops_[index]->postCoroutineTask(function);
-        }
-    }
-
     ISocket::SocketHandler addTimer(const std::shared_ptr<ISocket>& socket, std::chrono::milliseconds duration, const std::function<void()>& callback) {
         if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
             return addTimer(fd, duration, callback);
@@ -1065,13 +1079,6 @@ void EpollContext::registerCloseCallback(
 
 void EpollContext::postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const {
     impl->postTask(socket, function);
-}
-
-void EpollContext::postCoroutineTask(
-    const std::shared_ptr<ISocket>& socket,
-    const std::function<Task<void>()>& function
-) const {
-    impl->postCoroutineTask(socket, function);
 }
 
 ISocket::SocketHandler EpollContext::addTimer(
