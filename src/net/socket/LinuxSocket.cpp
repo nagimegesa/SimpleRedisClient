@@ -44,6 +44,15 @@ bool LinuxSocket::bind(const std::string& ip, unsigned short port) {
         return false;
     }
 
+    int enable = 1;
+    if (setsockopt(socket_fd,SOL_SOCKET, SO_REUSEADDR, &enable,sizeof(enable)) < 0) {
+        LOG(ERR) << "setsockopt SO_REUSEADDR failed";
+    }
+
+    if (setsockopt(socket_fd,SOL_SOCKET, SO_REUSEPORT, &enable,sizeof(enable)) < 0) {
+        LOG(ERR) << "setsockopt SO_REUSEADDR failed";
+    }
+
     if (::bind(socket_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == -1) {
         LOG(ERR) << "LinuxSocket::bind(): bind failed";
         return false;
@@ -198,11 +207,11 @@ void LinuxSocket::registerHighLevelCallback(const HighLevelCallback& callback) {
     }
 }
 
-void LinuxSocket::registerCloseCallback(const ClosingCallback& callback) {
+void LinuxSocket::registerScope(const std::shared_ptr<IEpollContextScope>& scope) {
     if (auto context = epollContext_.lock()) {
-        context->registerCloseCallback(shared_from_this(), callback);
+        context->registerScope(shared_from_this(), scope);
     } else {
-        LOG(ERR) << "LinuxSocket::registerCloseCallback: epollContext is nullptr";
+        LOG(ERR) << "LinuxSocket::registerScope: epollContext is nullptr";
     }
 }
 
@@ -233,16 +242,6 @@ void LinuxSocket::setNoBlock() {
     // 扩大读缓冲区
     if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVBUF, &ISocket::DEFAULT_RECV_BUFFER_SIZE, sizeof( ISocket::DEFAULT_RECV_BUFFER_SIZE ) )) {
         LOG(ERR) << "setsockopt SO_RCVBUF failed";
-    }
-
-    // 快速关闭
-    if (setsockopt(socket_fd,SOL_SOCKET, SO_REUSEADDR, &enable,sizeof(enable)) < 0) {
-        LOG(ERR) << "setsockopt SO_REUSEADDR failed";
-    }
-
-    // 快速关闭
-    if (setsockopt(socket_fd,SOL_SOCKET, SO_REUSEPORT, &enable,sizeof(enable)) < 0) {
-        LOG(ERR) << "setsockopt SO_REUSEADDR failed";
     }
 }
 

@@ -7,6 +7,7 @@
 #include <mutex>
 #include <queue>
 #include <atomic>
+#include <cassert>
 #include <thread>
 #include <vector>
 #include <unordered_map>
@@ -23,23 +24,31 @@
 #include "thread_pool/queue/LockFreeQueue.h"
 #include "socket/LinuxSocket.h"
 
+class EventLoopThread;
+
+struct Event {
+    enum class Kind : uint8_t { Connection, Accept, Timer, Wakeup } kind;
+    int fd;
+protected:
+    explicit Event(Kind k, int fd) : kind(k), fd(fd) {}
+};
+
 // 写元信息
 struct WriteMetaInfo {
-    // std::shared_ptr<ISocket> socket;
     std::string buffer;
     size_t offset = 0;
     WriteContextCallBack callback;
-
-    // WriteMetaInfo(std::shared_ptr<ISocket> s, WriteContextCallBack cb, std::shared_ptr<std::string> buf)
-    //     : socket(std::move(s)), buffer(std::move(buf)), callback(std::move(cb)) {}
     WriteMetaInfo(WriteContextCallBack&& cb, std::string&& buf) : buffer(std::move(buf)), callback(std::move(cb)) {}
 };
 
 // ------------------------- 内部结构定义 -------------------------
 
 // 连接对象，封装一个 fd 的所有状态
-struct Connection {
+struct Connection : public Event, std::enable_shared_from_this<Connection> {
+    std::size_t id;
     std::shared_ptr<ISocket> socket;          // 原始 socket
+    std::shared_ptr<IEpollContextScope> scope_;
+    EventLoopThread* loop_ = nullptr;
     ReadContextCallBack read_cb;              // 读回调
     SimpleBuffer read_buffer;                 // 读缓冲区
     // std::queue<WriteMetaInfo> write_queue;    // 写队列
@@ -54,20 +63,41 @@ struct Connection {
     bool peer_closed_ = false;                // 对端是否已关闭写端（收到 FIN）
     bool closing = false;
 
-    Connection(std::shared_ptr<ISocket> s, ReadContextCallBack cb)
-        : socket(std::move(s)), read_cb(std::move(cb)) {
+    Connection(
+        std::size_t id,
+        std::shared_ptr<ISocket> socket,
+        std::shared_ptr<IEpollContextScope> scope)
+        : Event(Event::Kind::Connection, socket->getNative()), id(id), socket(std::move(socket)), scope_(std::move(scope)) {
         read_buffer.resize(DEFAULT_BUFFER_SIZE);
     }
 
+    Connection(Connection&&)  noexcept = default;
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
+    ~Connection() = default;
+
+    static std::atomic<std::size_t> connection_id;
     constexpr static int DEFAULT_BUFFER_SIZE = 4096;
 };
 
-struct AcceptContext {
+std::atomic<std::size_t> Connection::connection_id = 0;
+
+struct AcceptContext : public Event {
     std::shared_ptr<ISocket> socket;
     AcceptContextCallback accept_cb;
 
-    AcceptContext(std::shared_ptr<ISocket> s, AcceptContextCallback cb) : socket(std::move(s)), accept_cb(std::move(cb)) {
+    AcceptContext(std::shared_ptr<ISocket> s, AcceptContextCallback cb) :
+        Event(Event::Kind::Accept, s->getNative()), socket(std::move(s)), accept_cb(std::move(cb)) {
     }
+};
+
+struct TimerContext : public Event {
+    std::function<void()> callback;
+    TimerContext(std::function<void()> func, int fd) : Event(Event::Kind::Timer, fd), callback(std::move(func)) {}
+};
+
+struct AwakeContext : public Event {
+    AwakeContext() : Event(Event::Kind::Wakeup, -1) {}
 };
 
 // 单个事件循环线程的实现
@@ -89,12 +119,21 @@ public:
         // 注册 wakeup_fd 到 epoll
         epoll_event ev{};
         ev.events = EPOLLIN;
-        ev.data.fd = wakeup_fd_;
+        ev.data.ptr = &awake_context_;
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_fd_, &ev);
     }
 
     ~EventLoopThread() {
         stop();
+        // stop() 在事件循环线程内部调用时刻意不 join（见下），这里兜底回收：
+        // 否则 std::thread 析构时仍 joinable 会直接 std::terminate
+        if (thread_.joinable()) {
+            if (inLoopThread()) {
+                thread_.detach(); // 析构发生在事件循环线程里，不能 join 自己
+            } else {
+                thread_.join();
+            }
+        }
         if (epoll_fd_ != -1) ::close(epoll_fd_);
         if (wakeup_fd_ != -1) ::close(wakeup_fd_);
     }
@@ -103,7 +142,10 @@ public:
     void start() {
         if (!running_) {
             running_ = true;
-            thread_ = std::thread([this] { run(); });
+            thread_ = std::thread([this] {
+                loop_id_ = std::this_thread::get_id(); // 由本线程自己写入，避免与 start() 竞争
+                run();
+            });
         }
     }
 
@@ -113,23 +155,28 @@ public:
             // 唤醒 epoll_wait
             uint64_t one = 1;
             ::write(wakeup_fd_, &one, sizeof(one));
-            if (thread_.joinable()) {
-                thread_.join();
-            }
+        }
+
+        // 在任一事件循环线程里都不做 join：
+        //  1) 事件循环线程里调用 close()（例如 RedisConnection::onDestroy -> client->close()）
+        //     会 join 当前线程自己 -> std::system_error: Resource deadlock avoided;
+        //  2) 两个事件循环互相 stop 时也会互相 join 而死锁。
+        // 线程回收交给外部线程：之后的 stop()（running_ 已为 false 也会走到这里）或析构函数。
+        if (thread_.joinable() && !inLoopThread()) {
+            thread_.join();
         }
     }
 
     void postTask(std::function<void()>&& task) { // 这里实际上只会接收右值
-        {
-            // std::lock_guard<std::mutex> lock(task_mutex_);
-            while (!task_queue_.push(std::move(task))) {} // push 可能返回 False 需要不断尝试
+        // postTask里面再PostTask走本地队列
+        if (std::this_thread::get_id() == loop_id_) {
+            local_tasks_.emplace_back(std::move(task));
+            return;
         }
 
-        // if (bool except = false; awake.compare_exchange_weak(except, true, std::memory_order_acq_rel)) {
-        //     // 唤醒 epoll_wait
-        //     uint64_t one = 1;
-        //     ::write(wakeup_fd_, &one, sizeof(one));
-        // }
+        while (!task_queue_.push(std::move(task))) { // push 可能返回 False 需要不断尝试
+            std::this_thread::yield();               // 让出 CPU：和消费者对转纯属浪费
+        }
 
         if (!awake.exchange(true, std::memory_order_release)) { // 如果 exchange 返回 false, 之前就是 false
             uint64_t one = 1;
@@ -138,8 +185,16 @@ public:
     }
 
     void postTaskBatch(std::vector<std::function<void()>>&& task_batch) {
+        const bool self = (std::this_thread::get_id() == loop_id_);
+
         for (auto& t : task_batch) {
-            while (!task_queue_.push(std::move(t))) {} // push 可能返回 False 需要不断尝试
+            if (self) { // 同 postTask：自投递不能走有界队列
+                local_tasks_.emplace_back(std::move(t));
+                continue;
+            }
+            while (!task_queue_.push(std::move(t))) { // push 可能返回 False 需要不断尝试
+                std::this_thread::yield();
+            }
         }
 
         if (!awake.exchange(true, std::memory_order_release)) { // 如果 exchange 返回 false, 之前就是 false
@@ -148,7 +203,7 @@ public:
         }
     }
 
-    ISocket::SocketHandler addTimer(std::chrono::milliseconds ms, std::function<void()> cb) {
+    ISocket::SocketHandler addTimer(std::chrono::milliseconds ms, const std::function<void()>& cb) {
         int timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
         if (timerfd < 0) {
             LOG(ERR) << "EpollContext::addTimer: timerfd_create failed";
@@ -168,12 +223,13 @@ public:
             LOG(ERR) << "EpollContext::addTimer: timerfd_settime failed";
             return ISocket::ERROR_SOCKET;;
         }
+        auto context = std::make_shared<TimerContext>(cb, timerfd);
+        const auto ptr = context.get();
+        timer_fds_.emplace(timerfd, std::move(context));
 
         ::epoll_event ev{};
-        ev.data.fd = timerfd;
+        ev.data.ptr = ptr;
         ev.events = EPOLLIN | EPOLLONESHOT;
-
-        timer_fds_.emplace(timerfd, std::move(cb));
 
         if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, timerfd, &ev) < 0) {
             ::close(timerfd);
@@ -187,11 +243,19 @@ public:
     }
 
 
-
 private:
     void run() {
+        // 标记当前线程正处于事件循环中：stop() 依赖它判断"能不能 join"
+        struct InLoopScope {
+            InLoopScope()  { in_loop_thread_ = true; }
+            ~InLoopScope() { in_loop_thread_ = false; }
+        } in_loop_scope;
+
         epoll_event events[MAX_EVENTS];
         while (running_) {
+            drainLocalTasks();
+            if (!running_) break;
+
             int n = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, -1);
             if (n == -1) {
                 if (errno == EINTR) continue;
@@ -199,30 +263,37 @@ private:
                 break;
             }
             for (int i = 0; i < n; ++i) {
-                int fd = events[i].data.fd;
-                if (fd == wakeup_fd_) {
-                    // 处理唤醒：清空 eventfd 并执行所有待处理任务
-                    uint64_t val;
-                    while (::read(wakeup_fd_, &val, sizeof(val)) > 0) {}
-                    drainTasks();
-                    continue;
-                }
-                // 处理普通事件
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    LOG(DEBUG) << "EventLoopThread: close connection because EPOLLERR | EPOLLHUP";
-                    closeConnection(fd);
-                    continue;
-                }
-                if (events[i].events & EPOLLIN) {
-                    handleRead(fd);
-                }
-                if (events[i].events & EPOLLOUT) {
-                    handleWrite(fd);
+                auto* event = static_cast<Event*>(events[i].data.ptr);
+                switch (event->kind) {
+                    case Event::Kind::Wakeup:
+                        uint64_t val;
+                        while (::read(wakeup_fd_, &val, sizeof(val)) > 0) {}
+                        drainTasks();
+                        break;
+                    case Event::Kind::Accept:
+                        handleAccept(static_cast<AcceptContext*>(event));
+                        break;
+                    case Event::Kind::Timer:
+                        handleTimer(static_cast<TimerContext*>(event));
+                        break;
+                    case Event::Kind::Connection: {
+                        auto* conn = static_cast<Connection*>(event);
+                        if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                            closeConnection(conn); break;
+                        }
+                        if (events[i].events & EPOLLIN)
+                            handleRead(conn);
+                        if (events[i].events & EPOLLOUT)
+                            handleWrite(conn);
+                        break;
+                    }
                 }
             }
         }
 
-        std::function<void()> task; // 关闭的时候清空任务
+        // 关闭的时候清空任务（先本地自投递任务，再全局队列）
+        drainLocalTasks();
+        std::function<void()> task;
         while (!task_queue_.empty()) {
             if (task_queue_.pop(task)) {
                 task();
@@ -245,13 +316,19 @@ private:
 
         std::function<void()> task;
 
-        while (task_queue_.pop(task)) { // 如果 pop 失败，下次在处理，这里不能保证 queue 是空
+        for (;;) {
+            if (!local_tasks_.empty()) {
+                task = std::move(local_tasks_.front());
+                local_tasks_.pop_front();
+            } else if (!task_queue_.pop(task)) { // 如果 pop 失败，下次在处理，这里不能保证 queue 是空
+                break;
+            }
             task();
         }
 
         awake.store(false, std::memory_order_release);
         // 如果 post task 提交了一个任务，在 store false 前，where 循环后，这个任务可能被丢失，所以这里再检查一次
-        if (!task_queue_.empty()) {
+        if (!task_queue_.empty() || !local_tasks_.empty()) {
             if (!awake.exchange(true, std::memory_order_release)) {
                 uint64_t one = 1;
                 ::write(wakeup_fd_, &one, sizeof(one));
@@ -259,8 +336,15 @@ private:
         }
     }
 
-    void handleAccept(int fd) const {
-        auto& context = accept_socket_set_.find(fd)->second;
+    void drainLocalTasks() {
+        while (!local_tasks_.empty()) {
+            auto task = std::move(local_tasks_.front());
+            local_tasks_.pop_front();
+            task();
+        }
+    }
+
+    void handleAccept(AcceptContext* context) const {
         auto client = context->socket->accept();
         if (client == nullptr) {
             LOG(ERR) << "EpollContext::handleAccept: accept failed";
@@ -273,33 +357,17 @@ private:
         LOG(DEBUG) << "Accept a new socket";
     }
 
-    void handleTimer(int fd) {
-        auto& callback = timer_fds_.find(fd)->second;
-        if (callback) {
-            callback();
+    void handleTimer(TimerContext* context) {
+        if (context->callback) {
+            context->callback();
         }
-        close(fd);
-        timer_fds_.erase(fd); // timer_fd 设置了 oneshot epoll 会自动移除
+        close(context->fd);
+        timer_fds_.erase(context->fd); // timer_fd 设置了 oneshot epoll 会自动移除
     }
 
-    void handleRead(int fd) {
+    void handleRead(Connection* conn) {
 
-        if (accept_socket_set_.contains(fd)) { // server 读事件
-            handleAccept(fd);
-            return;
-        }
-
-        if (timer_fds_.contains(fd)) {
-            handleTimer(fd);
-            return;
-        }
-
-        auto it = connections_.find(fd);
-        if (it == connections_.end()) return;
-
-        // 这里可以使用 & 是因为 不可能出现 conn 被移除的情况
-        // 因为 removeSocket 不可能在这个函数内被调用
-        auto& conn = it->second;
+        int fd = conn->socket->getNative();
 
         int data_size = conn->read_buffer.data_size();
         int capacity = conn->read_buffer.size();
@@ -328,10 +396,10 @@ private:
                 // 仍有数据待发送，注册写事件
                 if (!conn->write_registered) {
                     conn->write_registered = true;
-                    modifyEpollEvents(fd, EPOLLOUT);
+                    modifyEpollEvents(conn, EPOLLOUT);
                 } else {
                     // 之前可能同时监听了读写，改为只监听写
-                    modifyEpollEvents(fd, EPOLLOUT);
+                    modifyEpollEvents(conn, EPOLLOUT);
                 }
             } else {
                 // 无待写数据，移除所有事件监听，但保留连接对象
@@ -349,50 +417,16 @@ private:
                 return;
             }
             LOG(ERR) << "EventLoopThread: read error on fd " << fd << " error code " << errno;
-            closeConnection(fd);
+            closeConnection(conn);
         }
     }
 
-    void handleWrite(int fd) {
-        auto it = connections_.find(fd);
-        if (it == connections_.end()) return;
+    void handleWrite(Connection* conn) {
 
-        auto& conn = it->second;
+        assert(conn != nullptr); // 如果模型正确不可能到这里
 
-        // while (!conn->write_queue.empty()) {
-        //     auto& meta = conn->write_queue.front();
-        //     char* data = meta.buffer->data() + meta.offset;
-        //     size_t remaining = meta.buffer->size() - meta.offset;
-        //     int n = meta.socket->write(data, remaining);
-        //
-        //     if (n > 0) {
-        //         meta.offset += n;
-        //         if (meta.offset == meta.buffer->size()) {
-        //             if (meta.callback) meta.callback(true);
-        //             conn->write_queue.pop();
-        //         }
-        //     } else if (n == 0) {
-        //         LOG(DEBUG) << "EventLoopThread: handling write get write returns 0";
-        //         // 对端关闭，应视为错误
-        //         failAllPendingWrites(conn);
-        //         closeConnection(fd);
-        //         return;
-        //     } else { // n < 0
-        //         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        //             LOG(DEBUG) << "EventLoopThread: write error: errno " << errno;
-        //             // 写缓冲区满，等待下次 EPOLLOUT，停止本次处理
-        //             return;
-        //         } else {
-        //             LOG(ERR) << "EventLoopThread: write error on fd " << fd <<  " error code " << errno;
-        //             failAllPendingWrites(conn);
-        //             closeConnection(fd);
-        //             return;
-        //         }
-        //     }
-        // }
-
+        int fd = conn->socket->getNative();
         int write_count = std::min(static_cast<int>(conn->write_queue.size()), IOV_MAX);
-        std::size_t total_size = 0;
 
         std::vector<iovec> iovs;
         iovs.reserve(write_count);
@@ -405,8 +439,6 @@ private:
             if (iov.iov_len > 0) {
                 iovs.emplace_back(iov);
             }
-
-            total_size += iov.iov_len;
         }
 
         if (iovs.empty()) {
@@ -422,7 +454,7 @@ private:
             }
             LOG(ERR) << "EventLoopThread: write error, error code " << errno;
             failAllPendingWrites(conn);
-            closeConnection(fd);
+            closeConnection(conn);
             return;
         }
 
@@ -457,7 +489,7 @@ private:
             } else {
                 // 对端未关闭，根据读注册状态调整事件
                 if (conn->read_registered) {
-                    modifyEpollEvents(fd, EPOLLIN);
+                    modifyEpollEvents(conn, EPOLLIN);
                 } else {
                     // 无读事件，移除所有事件（保持连接，等待外部后续操作）
                     LOG(DEBUG) << "EventLoopThread: write queue empty and no read registered, remove fd from epoll, fd " << fd;
@@ -475,7 +507,7 @@ private:
         }
     }
 
-    void failAllPendingWrites(const std::shared_ptr<Connection>& conn) {
+    void failAllPendingWrites(Connection* conn) {
         if (!conn->write_queue.empty()) {
             LOG(DEBUG) << "EventLoopThread: all writes failed";
             while (!conn->write_queue.empty()) {
@@ -489,38 +521,61 @@ private:
         }
     }
 
-    void closeConnection(int fd) {
-        LOG(DEBUG) << "EventLoopThread: closing connection " << fd;
-
-        // 从 epoll 中删除
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-
+    void closeFd(int fd) {
+        LOG(DEBUG) << "EventLoopThread: close fd " << fd;
         if (accept_socket_set_.contains(fd)) {
             accept_socket_set_.erase(fd);
+            ::close(fd);
             return;
         }
 
-        auto it = connections_.find(fd);
-        if (it == connections_.end()) return;
-        auto conn = it->second; // 拷贝 shared_ptr 以便在 map 外使用
-        conn->closing = true;
-
-        if (conn->closing_callback) {
-            conn->closing_callback(conn->socket);
+        if (timer_fds_.contains(fd)) {
+            timer_fds_.erase(fd);
+            ::close(fd);
+            return;
         }
 
-        // 通知所有待写请求失败
-        failAllPendingWrites(conn);
-
-        // 从 map 中移除, 这里可能会触发socket 析构，或者 conn 里面还有数据没写完，所以放在最后
-        connections_.erase(it);
+        LOG(ERR) << "EventLoopThread: 如果模型正确，不可能走到这里" << fd;
+        assert(false);
     }
 
-    void modifyEpollEvents(int fd, uint32_t events) {
+    void closeConnection(Connection* connection) {
+        std::shared_ptr<Connection> conn = connection->shared_from_this();
+        postTask([conn, this]() {
+            assert(conn != nullptr); // 如果使用正确 conn 不可能是 nullptr
+
+            if (conn->closing) {
+                return;
+            }
+
+            conn->closing = true;
+
+            if (conn->closing_callback) {
+                conn->closing_callback(conn->socket);
+            }
+
+            conn->scope_->onDestroy(); // 通知上层进行销毁
+
+
+            int fd = conn->socket->getNative();
+            LOG(DEBUG) << "EventLoopThread: closing connection " << fd;
+
+            // 从 epoll 中删除
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+
+            // 通知所有待写请求失败
+            failAllPendingWrites(conn.get());
+
+            // 从 map 中移除, 这里可能会触发socket 析构，或者 conn 里面还有数据没写完，所以放在最后
+            connections_.erase(conn->id);
+        });
+    }
+
+    void modifyEpollEvents(Connection* conn, uint32_t events) {
         epoll_event ev{};
         ev.events = events;
-        ev.data.fd = fd;
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+        ev.data.ptr = conn;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, conn->socket->getNative(), &ev);
     }
 
 public:
@@ -530,84 +585,61 @@ public:
             accept_socket_set_[fd]->accept_cb = callback;
             return;
         }
-        accept_socket_set_[fd] = std::make_shared<AcceptContext>(socket, callback);
+
+        auto context = std::make_shared<AcceptContext>(socket, callback);
+
+        accept_socket_set_[fd] = context;
         socket->setNoBlock();
 
         epoll_event ev{};
         ev.events = EPOLLIN;
-        ev.data.fd = fd;
+        ev.data.ptr = context.get();
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
     }
 
-    // 以下为通过 postTask 调用的函数（在事件循环线程执行）
-    void doRegisterRead(int fd, const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) {
-        // 如果连接已存在，更新读回调和事件；否则新建
-        auto it = connections_.find(fd);
-        if (it != connections_.end()) {
-            auto& conn = it->second;
-            conn->read_cb = callback;
-            // 如果对端已半关闭，则不再注册读事件
-            if (conn->peer_closed_) {
-                LOG(DEBUG) << "EventLoopThread: ignore read registration because peer already closed, fd " << fd;
-                return;
-            }
-            if (!conn->read_registered) {
-                conn->read_registered = true;
-                if (conn->write_registered) {
-                    modifyEpollEvents(fd, EPOLLIN | EPOLLOUT);
-                } else {
-                    modifyEpollEvents(fd, EPOLLIN);
-                }
-            }
+    void doRegisterRead(const std::shared_ptr<Connection>& conn, const ReadContextCallBack& callback) {
+
+        if (conn->closing) {
+            LOG(WARNING) << "EventLoopThread: connection is closing, register read failed";
             return;
         }
 
-        // 新建连接
-        auto conn = std::make_shared<Connection>(socket, callback);
-        if (socket != conn->socket) {
-            LOG(WARNING) << "EventLoopThread: connection is closing, read failed";
+        if (conn->read_registered) {
+            LOG(WARNING) << "EventLoopThread: already register read, fd " << conn->socket->getNative();
+            conn->read_cb = callback;
             return;
         }
+
+        if (conn->peer_closed_) { // 对端已经关闭写
+            LOG(DEBUG) << "EventLoopThread: ignore read registration because peer already closed, fd " << conn->socket->getNative();
+            return;
+        }
+
+        conn->read_cb = callback;
+        auto& socket = conn->socket;
+        int fd = socket->getNative();
+
+
 
         conn->read_registered = true;
-        connections_[fd] = conn;
+        // 注册过写函数
+        if (conn->write_registered) {
+            modifyEpollEvents(conn.get(), EPOLLIN | EPOLLOUT);
+            return;
+        }
 
-        socket->setNoBlock(); // 设置非阻塞
-
-        // 注册到 epoll
+        // 只注册读
         epoll_event ev{};
         ev.events = EPOLLIN;
-        ev.data.fd = fd;
+        ev.data.ptr = conn.get();
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
     }
 
-    void doAsyncWriteOnce(int fd, std::shared_ptr<ISocket>&& socket,
+    void doAsyncWriteOnce(const std::shared_ptr<Connection>& conn ,
                           WriteContextCallBack&& callback, std::string&& buf) {
-        // 如果连接不存在，则创建一个只写连接
-        auto it = connections_.find(fd);
-        if (it == connections_.end()) {
-            LOG(WARNING) << "EventLoopThread: no connection found for fd " << fd;
-            if (callback) {
-                callback(false);
-            }
-            return;
-            // auto conn = std::make_shared<Connection>(std::move(socket), nullptr);
-            // conn->write_registered = true;
-            // connections_[fd] = conn;
-            //
-            // epoll_event ev{};
-            // ev.events = EPOLLOUT;
-            // ev.data.fd = fd;
-            // ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
-            //
-            // it = connections_.find(fd); // 重新获取
-        }
 
-        // 这里可以使用 & 是因为 不可能出现 conn 被移除的情况
-        // 因为 removeSocket 不可能在这个函数内被调用
-        auto& conn = it->second;
 
-        if (conn->closing || conn->socket != socket) {
+        if (conn->closing) {
             LOG(WARNING) << "EventLoopThread: connection is closing, write failed";
             if (callback) {
                 callback(false);
@@ -631,39 +663,22 @@ public:
         if (!conn->write_registered) {
             conn->write_registered = true;
             if (conn->read_registered) {
-                modifyEpollEvents(fd, EPOLLIN | EPOLLOUT);
+                modifyEpollEvents(conn.get(), EPOLLIN | EPOLLOUT);
             } else {
-                modifyEpollEvents(fd, EPOLLOUT);
+                // modifyEpollEvents(conn.get(), EPOLLOUT);
+                // 没有注册过写和读需要添加 fd
+                epoll_event ev{};
+                ev.events = EPOLLOUT;
+                ev.data.ptr = conn.get();
+                ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, conn->socket->getNative(), &ev);
             }
         }
     }
 
-    void doAsyncWriteBatch(int fd, std::shared_ptr<ISocket>&& socket,
+    void doAsyncWriteBatch(const std::shared_ptr<Connection>& conn,
                        BatchWriteContextCallback&& callbacks,
                        std::vector<std::string>&& bufs) {
-
-        auto it = connections_.find(fd);
-        if (it == connections_.end()) {
-            LOG(WARNING) << "EventLoopThread: no connection found for fd " << fd;
-            if (callbacks) {
-                callbacks(false, -1);
-            }
-            return;
-            // auto conn = std::make_shared<Connection>(std::move(socket), nullptr);
-            // conn->write_registered = true;
-            // connections_[fd] = conn;
-            //
-            // epoll_event ev{};
-            // ev.events = EPOLLOUT;
-            // ev.data.fd = fd;
-            // ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
-            //
-            // it = connections_.find(fd);
-        }
-
-        auto& conn = it->second;
-
-        if (conn->closing || conn->socket != socket) {
+        if (conn->closing) {
             LOG(WARNING) << "EventLoopThread: connection is closing, write failed";
             if (callbacks) {
                 callbacks(false, -1);
@@ -686,47 +701,30 @@ public:
         if (!conn->write_registered) {
             conn->write_registered = true;
             if (conn->read_registered) {
-                modifyEpollEvents(fd, EPOLLIN | EPOLLOUT);
+                modifyEpollEvents(conn.get(), EPOLLIN | EPOLLOUT);
             } else {
-                modifyEpollEvents(fd, EPOLLOUT);
+                epoll_event ev{};
+                ev.events = EPOLLOUT;
+                ev.data.ptr = conn.get();
+                ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, conn->socket->getNative(), &ev);
             }
         }
     }
 
-    void doRegisterHighLevelCallback(int fd, const HighLevelCallback& callback) {
-        auto it = connections_.find(fd);
-        if (it == connections_.end()) {
-            LOG(WARNING) << "EventLoopThread: try register a callback for unknown socket " << fd;
-            return;
-        }
+    void doRegisterScope(const std::shared_ptr<ISocket>& socket, const std::shared_ptr<IEpollContextScope>& scope) {
+        LOG(DEBUG) << "EpollLoopThread: RegisterScope " << socket->getNative();
+        std::size_t id = Connection::connection_id.fetch_add(1);
+        auto connection = std::make_shared<Connection>(id, socket, scope);
+        connection->loop_ = this;
+        socket->setConnection(connection);
+        socket->setNoBlock();
+        connections_.emplace(id, connection);
 
-        auto& conn = it->second;
-        conn->high_level_callback = callback;
-    }
+        scope->postTask = [this](std::function<void()> callback) {
+            this->postTask(std::move(callback));
+        };
 
-    void doRegisterLowLevelCallback(int fd, const LowLevelCallback& callback) {
-        auto it = connections_.find(fd);
-        if (it == connections_.end()) {
-            LOG(WARNING) << "EventLoopThread: try register a callback for unknown socket " << fd;
-            return;
-        }
-
-        auto& conn = it->second;
-        conn->low_level_callback = callback;
-    }
-
-    void doRegisterCloseCallback(int fd, const ClosingCallback& callback) {
-        auto it = connections_.find(fd);
-        if (it == connections_.end()) {
-            LOG(WARNING) << "EventLoopThread: try register a callback for unknown socket " << fd;
-            return;
-        }
-        auto& conn = it->second;
-        conn->closing_callback = callback;
-    }
-
-    void doClose(int fd) {
-        closeConnection(fd);
+        scope->onRegister(socket);
     }
 
     void join() {
@@ -740,19 +738,26 @@ private:
     alignas(std::hardware_constructive_interference_size)
     std::atomic<bool> awake{false};
     std::thread thread_;
+    std::thread::id loop_id_{};                      // 本事件循环线程的 id（由该线程自己写入）
+    std::deque<std::function<void()>> local_tasks_;  // 自投递任务：无界，仅本事件循环线程访问
+    static thread_local bool in_loop_thread_;        // 当前线程是否正运行在某个事件循环里
 
-    std::unordered_map<int, std::shared_ptr<Connection>> connections_; // 仅在事件循环线程访问
+    static bool inLoopThread() { return in_loop_thread_; }
+
+    std::unordered_map<std::size_t, std::shared_ptr<Connection>> connections_; // 保留 connection 防止被销毁
     std::unordered_map<int, std::shared_ptr<AcceptContext>> accept_socket_set_;
-    std::unordered_map<int, std::function<void(void)>> timer_fds_;
+    std::unordered_map<int, std::shared_ptr<TimerContext>> timer_fds_;
     // std::queue<std::function<void()>> task_queue_;                     // 待处理任务队列
     // std::mutex task_mutex_;                                            // 保护任务队列
     MPSCQueue<std::function<void()>, 512> task_queue_;
 
-    std::size_t coroutineId = 0;
+    AwakeContext awake_context_;
 
     constexpr static int MAX_EVENTS = 2048;
     friend EpollContextImpl;
 };
+
+thread_local bool EventLoopThread::in_loop_thread_ = false;
 
 // ------------------------- EpollContext::Impl -------------------------
 struct EpollContextImpl {
@@ -761,19 +766,43 @@ struct EpollContextImpl {
     std::vector<std::unique_ptr<EventLoopThread>> loops_;
 
     static bool checkSocket(const std::shared_ptr<ISocket>& socket, int& fd) {
-        if (auto sc = std::static_pointer_cast<LinuxSocket>(socket)) {
-            fd = sc->getNative();
-            if (fd == ISocket::ERROR_SOCKET) {
-                LOG(ERR) << "EpollContext: invalid socket fd";
-                return false;
-            }
-        } else {
-            LOG(ERR) << "EpollContext: socket not available";
+        if (socket == nullptr) {
+            LOG(ERR) << "EpollContext: socket is nullptr";
             return false;
         }
 
+        fd = socket->getNative();
+        if (fd == ISocket::ERROR_SOCKET) {
+            LOG(ERR) << "EpollContext: invalid socket fd";
+            return false;
+        }
         return true;
     }
+
+    std::shared_ptr<Connection> checkSocketWithConnection(const std::shared_ptr<ISocket>& socket) {
+        if (socket == nullptr) {
+            LOG(ERR) << "EpollContext: socket is nullptr";
+            return nullptr;
+        }
+
+        if (socket->getNative() == ISocket::ERROR_SOCKET) {
+            LOG(ERR) << "EpollContext: invalid socket fd";
+            return nullptr;
+        }
+
+        auto conn = socket->getConnection();
+        if (conn == nullptr) {
+            LOG(ERR) << "EpollContext: connection is nullptr";
+            return nullptr;
+        }
+
+        if (conn->closing) {
+            LOG(ERR) << "EpollContext: connection is closing";
+            return nullptr;
+        }
+
+        return conn;
+    };
 
 public:
     EpollContextImpl() {
@@ -804,12 +833,9 @@ public:
     }
 
     void registerRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) {
-        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
-            // 根据 fd 哈希选择事件循环线程
-            std::size_t index = std::hash<int>{}(fd) % loops_.size();
-            // 提交任务到对应线程
-            loops_[index]->postTask([this, index, fd, socket, callback] {
-                loops_[index]->doRegisterRead(fd, socket, callback);
+        if (auto conn = checkSocketWithConnection(socket)) {
+            conn->loop_->postTask([callback, conn] {
+                conn->loop_->doRegisterRead(conn, callback);
             });
         } else {
             LOG(ERR) << "registerRead failed";
@@ -837,37 +863,29 @@ public:
         asyncWriteOnceImpl(socket, callback, buf);
     }
 
-    void asyncWriteOnceImpl(std::shared_ptr<ISocket> socket, WriteContextCallBack callback,
+    void asyncWriteOnceImpl(const std::shared_ptr<ISocket>& socket, WriteContextCallBack callback,
                         std::string& buf) {
 
         struct WriteContext {
-            int fd = ISocket::ERROR_SOCKET;
-            EpollContextImpl* impl = nullptr;
-            std::size_t index = -1;
-            std::shared_ptr<ISocket> socket;
+            std::shared_ptr<Connection> conn;
             WriteContextCallBack callback;
             std::string buf;
 
-            WriteContext(std::shared_ptr<ISocket>&& socket,
+            WriteContext(std::shared_ptr<Connection>&& conn,
                 WriteContextCallBack&& callback, std::string&& buf)
-                : socket(std::move(socket)), callback(std::move(callback)), buf(std::move(buf)) {}
+                : conn(std::move(conn)), callback(std::move(callback)), buf(std::move(buf)) {}
         };
 
-        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
-            std::size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (auto conn = checkSocketWithConnection(socket)) {
 
+            auto loops = conn->loop_;
             // 使用 WriteContext 优化 std::function 的堆分配，但是会多一次 shared_ptr, 后面可以改成 unique_ptr
             std::shared_ptr<WriteContext> context = std::make_shared<WriteContext>(
-                std::move(socket), std::move(callback), std::move(buf)
+                std::move(conn), std::move(callback), std::move(buf)
             );
 
-            context->impl = this;
-            context->fd = fd;
-            context->index = index;
-
-            loops_[index]->postTask([context = std::move(context)] {
-                context->impl->loops_[context->index]->doAsyncWriteOnce(context->fd, std::move(context->socket),
-                    std::move(context->callback), std::move(context->buf));
+            loops->postTask([context = std::move(context)] {
+                context->conn->loop_->doAsyncWriteOnce(context->conn, std::move(context->callback), std::move(context->buf));
             });
 
         } else {
@@ -886,36 +904,29 @@ public:
         asyncWriteBatchImpl(socket, callback, std::move(buf));
     }
 
-    void asyncWriteBatchImpl(std::shared_ptr<ISocket> socket,
+    void asyncWriteBatchImpl(const std::shared_ptr<ISocket>& socket,
                          BatchWriteContextCallback callback,
                          std::vector<std::string> bufs) {
         struct WriteContext {
-            int fd = ISocket::ERROR_SOCKET;
-            EpollContextImpl* impl = nullptr;
-            std::size_t index = -1;
-            std::shared_ptr<ISocket> socket;
+            std::shared_ptr<Connection> conn;
             BatchWriteContextCallback callback;
             std::vector<std::string> bufs;
 
-            WriteContext(std::shared_ptr<ISocket>&& s,
+            WriteContext(std::shared_ptr<Connection>&& conn,
                          BatchWriteContextCallback&& cbs,
                          std::vector<std::string>&& b)
-                : socket(std::move(s)), callback(std::move(cbs)), bufs(std::move(b)) {}
+                : conn(std::move(conn)), callback(std::move(cbs)), bufs(std::move(b)) {}
         };
 
-        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
-            std::size_t index = std::hash<int>{}(fd) % loops_.size();
+        if (auto conn = checkSocketWithConnection(socket)) {
+            auto loops = conn->loop_;
 
             auto context = std::make_shared<WriteContext>(
-                std::move(socket), std::move(callback), std::move(bufs));
-            context->impl  = this;
-            context->fd    = fd;
-            context->index = index;
+                std::move(conn), std::move(callback), std::move(bufs));
 
-            loops_[index]->postTask([context = std::move(context)] {
-                context->impl->loops_[context->index]->doAsyncWriteBatch(
-                    context->fd,
-                    std::move(context->socket),
+            loops->postTask([context = std::move(context)] {
+                context->conn->loop_->doAsyncWriteBatch(
+                    context->conn,
                     std::move(context->callback),
                     std::move(context->bufs));
             });
@@ -926,11 +937,8 @@ public:
     }
 
     void removeSocket(const std::shared_ptr<ISocket>& socket) {
-        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
-            std::size_t index = std::hash<int>{}(fd) % loops_.size();
-            loops_[index]->postTask([this, index, fd] {
-                loops_[index]->doClose(fd);
-            });
+        if (auto conn = checkSocketWithConnection(socket)) {
+            conn->loop_->closeConnection(conn.get());
         } else {
             LOG(ERR) << "removeSocket failed";
         }
@@ -957,10 +965,9 @@ public:
     }
 
     void registerHighLevel(const std::shared_ptr<ISocket>& socket, const HighLevelCallback& callback) {
-        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
-            std::size_t index = std::hash<int>{}(fd) % loops_.size();
-            loops_[index]->postTask([this, index, fd, callback] {
-                loops_[index]->doRegisterHighLevelCallback(fd, callback);
+        if (auto conn = checkSocketWithConnection(socket)) {
+            conn->loop_->postTask([conn, callback] {
+                conn->high_level_callback = callback;
             });
         } else {
             LOG(ERR) << "registerHighLevel failed";
@@ -968,24 +975,12 @@ public:
     }
 
     void registerLowLevel(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) {
-        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
-            std::size_t index = std::hash<int>{}(fd) % loops_.size();
-            loops_[index]->postTask([this, index, fd, callback] {
-               loops_[index]->doRegisterLowLevelCallback(fd, callback);
+        if (auto conn = checkSocketWithConnection(socket)) {
+            conn->loop_->postTask([conn, callback] {
+                conn->low_level_callback = callback;
             });
         } else {
             LOG(ERR) << "registerLowLevel failed";
-        }
-    }
-
-    void registerCloseCallback(const std::shared_ptr<ISocket>& socket, const ClosingCallback& callback) {
-        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
-            std::size_t index = std::hash<int>{}(fd) % loops_.size();
-            loops_[index]->postTask([this, index, fd, callback] {
-                loops_[index]->doRegisterCloseCallback(fd, callback);
-            });
-        } else {
-            LOG(ERR) << "registerCloseCallback failed";
         }
     }
 
@@ -1018,11 +1013,27 @@ public:
         std::size_t index = std::hash<int>{}(fd) % loops_.size();
         return loops_[index]->addTimer(duration, callback);
     }
+
+    void registerScope(const std::shared_ptr<ISocket>& socket, const std::shared_ptr<IEpollContextScope>& scope) {
+        if (int fd = ISocket::ERROR_SOCKET; checkSocket(socket, fd)) {
+            std::size_t index = std::hash<int>{}(fd) % loops_.size();
+            loops_[index]->postTask([this, index, socket, scope] {
+                loops_[index]->doRegisterScope(socket, scope);
+            });
+        }
+    }
 };
 
 EpollContext::EpollContext() : impl(std::make_unique<EpollContextImpl>()) {}
 
 EpollContext::~EpollContext() = default;
+
+void EpollContext::registerScope(
+    const std::shared_ptr<ISocket>& socket,
+    const std::shared_ptr<IEpollContextScope>& scope
+) const {
+    impl->registerScope(socket, scope);
+}
 
 void EpollContext::registerAsyncAccept(const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) const {
     impl->registerAccept(socket, callback);
@@ -1068,13 +1079,6 @@ void EpollContext::registerLowLevelCallback(
     const LowLevelCallback& callback
 ) const {
     impl->registerLowLevel(socket, callback);
-}
-
-void EpollContext::registerCloseCallback(
-    const std::shared_ptr<ISocket>& socket,
-    const ClosingCallback& callback
-) const {
-    impl->registerCloseCallback(socket, callback);
 }
 
 void EpollContext::postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const {

@@ -8,8 +8,11 @@
 #include <functional>
 #include <chrono>
 
+
 class SocketManager;
 class EpollContext;
+class IEpollContextScope;
+struct Connection;
 class ISocket;
 
 using AcceptContextCallback = std::function<void(const std::shared_ptr<ISocket>& client)>;
@@ -35,6 +38,8 @@ using SockHandle = SOCKET;
 
 protected:
     std::weak_ptr<EpollContext> epollContext_;
+    std::weak_ptr<Connection> connection_;
+
 public:
     explicit                         ISocket(const std::shared_ptr<EpollContext>& epollContext) : epollContext_(epollContext) {};
     virtual                          ~ISocket() = default;
@@ -59,7 +64,7 @@ public:
 
     virtual void registerHighLevelCallback(const HighLevelCallback& callback) = 0;
     virtual void registerLowLevelCallback(const LowLevelCallback& callback) = 0;
-    virtual void registerCloseCallback(const ClosingCallback& callback) = 0;
+    virtual void registerScope(const std::shared_ptr<IEpollContextScope>& scope) = 0;
 
     // !! 注意这里 EpollContext 只适配了 linux
     std::shared_ptr<EpollContext> getContext() const {
@@ -68,6 +73,15 @@ public:
         }
 
         throw std::runtime_error("context 的周期一定比 socket 长，如果使用正确，不会执行到这里");
+    }
+
+    // 外面不会调用这个方法
+    void setConnection(const std::shared_ptr<Connection>& connection) {
+        connection_ = connection;
+    }
+
+    std::shared_ptr<Connection> getConnection() const {
+        return connection_.lock();
     }
 
 

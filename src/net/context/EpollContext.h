@@ -16,7 +16,19 @@ static_assert(false, "this context is only for linux");
 class ISocket;
 
 #ifdef __linux__
+
+
 struct EpollContextImpl;
+
+class IEpollContextScope {
+public:
+    virtual ~IEpollContextScope() = default;
+    virtual void onRegister(const std::shared_ptr<ISocket>& socket) = 0;
+    virtual void onDestroy() = 0;
+    std::function<void(std::function<void()>)> postTask;
+
+    friend struct EpollContextImpl;
+};
 
 class EpollContext {
     std::unique_ptr<EpollContextImpl> impl;
@@ -25,6 +37,8 @@ public:
 
     EpollContext(const EpollContext&) = delete;
     EpollContext& operator=(const EpollContext&) = delete;
+
+    void registerScope(const std::shared_ptr<ISocket>& socket, const std::shared_ptr<IEpollContextScope>& scope) const;
 
     void registerAsyncAccept(const std::shared_ptr<ISocket>& socket, const AcceptContextCallback& callback) const;
     void registerAsyncRead(const std::shared_ptr<ISocket>& socket, const ReadContextCallBack& callback) const;
@@ -47,7 +61,6 @@ public:
     void removeSocket(const std::shared_ptr<ISocket>& socket) const;
     void registerHighLevelCallback(const std::shared_ptr<ISocket>& socket, const HighLevelCallback& callback) const;
     void registerLowLevelCallback(const std::shared_ptr<ISocket>& socket, const LowLevelCallback& callback) const;
-    void registerCloseCallback(const std::shared_ptr<ISocket>& socket, const ClosingCallback& callback) const;
     void postTask(const std::shared_ptr<ISocket>& socket, const std::function<void()>& function) const;
     ISocket::SocketHandler addTimer(
         const std::shared_ptr<ISocket>&  socket,

@@ -12,48 +12,90 @@
 #include <queue>
 #include <utility>
 
-struct RedisConnection {
-    std::shared_ptr<ISocket> socket;
-    std::queue<std::shared_ptr<std::promise<RESPValue>>> promises;
-
-    std::deque<std::shared_ptr<std::promise<RESPValue>>> writing_promises;
-    std::vector<std::string> writing_cmds;
-
-    bool flush_time = false;
-
-    // SpinLock lock; // 自旋锁比 mutex 好一点，但是不多
-    // std::mutex lock;
-
-    std::atomic<bool> highLevel = {false };
-
-    RedisConnection() = default;
-    RedisConnection(RedisConnection&& r) noexcept : socket(std::move(r.socket)), promises(std::move(r.promises)),
-        writing_promises(std::move(r.writing_promises)), writing_cmds(std::move(r.writing_cmds)) {
-        highLevel = r.highLevel.load();
-    };
-};
-
 struct SimpleRedisClient::ClientImpl {
+
+    struct RedisConnection : IEpollContextScope {
+        std::queue<std::shared_ptr<std::promise<RESPValue>>> promises;
+        std::deque<std::shared_ptr<std::promise<RESPValue>>> writing_promises;
+        std::vector<std::string> writing_cmds;
+
+        SimpleRedisClient::ClientImpl* client = nullptr;
+
+        bool flush_time = false;
+        bool closing = false;
+        std::atomic<bool> registered = false;
+
+        ISocket* socket = nullptr; // socket 在 destroy 前一定存在
+
+        // SpinLock lock; // 自旋锁比 mutex 好一点，但是不多
+        // std::mutex lock;
+
+        std::atomic<bool> highLevel = {false };
+        RedisConnection(ClientImpl* impl, ISocket* socket) : client(impl), socket(socket) {};
+
+        RedisConnection(RedisConnection&& r) noexcept : promises(std::move(r.promises)),
+            writing_promises(std::move(r.writing_promises)), writing_cmds(std::move(r.writing_cmds)) {
+            highLevel = r.highLevel.load();
+            client = r.client;
+            r.client = nullptr;
+        };
+
+        void onDestroy() override {
+            closing = true;
+            socket = nullptr;
+
+            if (client != nullptr) {
+                client->onConnectionClosed();
+            }
+        }
+
+        void onRegister(const std::shared_ptr<ISocket>& socket) override {
+            socket->asyncRead([this](const std::string& buf, std::size_t sz) {
+                return client->read(*this, buf, sz);
+            });
+
+            registered = true;
+
+            // socket->registerHighLevelCallback([this](const std::shared_ptr<ISocket>& _) {
+            //     LOG(WARNING) << "SimpleRedisClient: HighLevelCallback is call, stop for write";
+            //     highLevel = true;
+            // });
+            //
+            // socket->registerLowLevelCallback([this](const std::shared_ptr<ISocket>& _) {
+            //     highLevel = false;
+            // });
+        }
+    };
+
     std::shared_ptr<EpollContext> epollContext;
-    std::vector<RedisConnection> clients;
+    std::vector<std::shared_ptr<RedisConnection>> clients;
+    std::atomic<bool> connection_closed_{false}; // 连接失效标记（可能由事件循环线程写）
     static thread_local std::size_t counter;
+
+    void onConnectionClosed() {
+        connection_closed_.store(true, std::memory_order_release);
+    }
 
     constexpr static size_t WRITE_BATCH_SIZE = 1000;
 
     ClientImpl() {
         epollContext = std::make_shared<EpollContext>();
-        clients.resize(DEFAULT_CLIENT_COUNT);
-        for (int i = 0; i < DEFAULT_CLIENT_COUNT; i++) {
-            clients[i].socket = SocketManager::getInstance().getSocket(epollContext);
-        }
     }
 
-    ~ ClientImpl() = default;
+    ~ ClientImpl() {
+        close();
+    }
 
     bool connect(const std::string& host, const unsigned short& port) {
         bool res = true;
-        for (const auto& client : clients) {
-            res &= client.socket->connect(host.c_str(), port);
+        epollContext->run();
+
+        for (int i = 0; i < DEFAULT_CLIENT_COUNT; i++) {
+            auto socket = SocketManager::getInstance().getSocket(epollContext);
+            res &= socket->connect(host.data(), port);
+            auto connection = std::make_shared<RedisConnection>(this, socket.get());
+            socket->registerScope(connection);
+            clients.emplace_back(connection);
         }
 
         if (!res) {
@@ -62,31 +104,11 @@ struct SimpleRedisClient::ClientImpl {
             return false;
         }
 
-        for (auto& client : clients) {
-            client.socket->asyncRead([this, &client](const std::string& buf, std::size_t sz) {
-                return this->read(client, buf, sz);
-            });
-
-            // client.socket->registerHighLevelCallback([&client](const std::shared_ptr<ISocket>& socket) {
-            //     LOG(WARNING) << "SimpleRedisClient: HighLevelCallback is call, stop for write";
-            //     client.highLevel = true;
-            // });
-            //
-            // client.socket->registerLowLevelCallback([&client](const std::shared_ptr<ISocket>& socket) {
-            //     client.highLevel = false;
-            // });
-        }
-        epollContext->run();
         return true;
     }
 
     void close() {
-        for (const auto& client : clients) {
-            if (client.socket != nullptr) {
-                client.socket->close();
-            }
-        }
-
+        clients.clear();
         epollContext->close();
     }
 
@@ -94,91 +116,94 @@ struct SimpleRedisClient::ClientImpl {
         std::size_t which_sock = std::hash<std::size_t>{}(++SimpleRedisClient::ClientImpl::counter) % clients.size();
 
         auto p = std::make_shared<std::promise<RESPValue>>();
-        if (clients[which_sock].highLevel) {
+        if (clients[which_sock]->highLevel) {
             p->set_exception(std::make_exception_ptr(std::runtime_error("to many bytes to write")));
             return p;
         }
 
         auto& conn = clients[which_sock];
+        conn->postTask([conn, args = std::move(args), promise = p]() mutable {
 
-        // 原本就是想省掉这个postTask, 但是又绕回去了，是只是整体更稳定一点
-        conn.socket->getContext()->postTask(conn.socket, [&conn, args = std::move(args), promise = p]() mutable {
-            conn.writing_cmds.emplace_back(std::move(args));
-            conn.writing_promises.emplace_back(std::move(promise));
+            if (conn->closing) {
+                promise->set_exception(std::make_exception_ptr(std::runtime_error("connection is closing")));
+                return;
+            }
 
-            auto batch_write_callback = [&conn](bool success, int index) {
-                auto promise = std::move(conn.writing_promises.front());
-                conn.writing_promises.pop_front();
+            // 原本就是想省掉这个postTask, 但是又绕回去了，是只是整体更稳定一点
+            conn->writing_cmds.emplace_back(std::move(args));
+            conn->writing_promises.emplace_back(std::move(promise));
+
+            auto batch_write_callback = [conn](bool success, int index) {
+                auto promise = std::move(conn->writing_promises.front());
+                conn->writing_promises.pop_front();
                 if (!success) {
                     LOG(ERR) << "SimpleRedisClient::execute() failed";
                     promise->set_exception(std::make_exception_ptr(std::runtime_error("write error")));
                     return;
                 }
-                conn.promises.push(std::move(promise));
+                conn->promises.push(std::move(promise));
             };
 
-            auto flush = [&conn, batch_write_callback]() {
-                if (!conn.writing_cmds.empty()) {
+            auto flush = [conn, batch_write_callback]() {
+                if (!conn->writing_cmds.empty()) {
                     std::vector<std::string> cmds;
-                    cmds.swap(conn.writing_cmds);
-                    conn.socket->asyncWriteBatch(batch_write_callback, std::move(cmds));
+                    cmds.swap(conn->writing_cmds);
+                    conn->socket->asyncWriteBatch(batch_write_callback, std::move(cmds));
                 }
             };
 
-            if (conn.writing_cmds.size() >= WRITE_BATCH_SIZE) {
+            if (conn->writing_cmds.size() >= WRITE_BATCH_SIZE) {
                 flush();
-            } else if (!conn.flush_time) {
+            } else if (!conn->flush_time) {
                 ISocket::SocketHandler handler =
-                    conn.socket->addTimer(std::chrono::milliseconds(10),[&conn, flush]() {
+                    conn->socket->addTimer(std::chrono::milliseconds(10),[conn, flush]() {
                         flush();
-                        conn.flush_time = false;
+                        conn->flush_time = false;
                 });
 
                 if (handler != ISocket::ERROR_SOCKET) {
-                    conn.flush_time = true;
+                    conn->flush_time = true;
                     flush();
                 }
             }
         });
-
         return p;
     }
 
     std::shared_ptr<std::promise<RESPValue>> execute(std::string cmd) { // C++ 17 保证传入右值不会拷贝
-        std::size_t which_sock = std::hash<std::size_t>{}(++SimpleRedisClient::ClientImpl::counter) % clients.size();
-        auto p = std::make_shared<std::promise<RESPValue>>();
-        // {
-        //     std::lock_guard _(clients[which_sock].lock);
-        //     clients[which_sock].socket->asyncWriteOnce(*epollContext,
-        //         [p](bool success) {
-        //             if (!success) {
-        //                 // TODO: 这里或许需要 把失败的 promises 删除。或者设置异常，但是没想好怎么写
-        //                 // TODO: 但是其实大部分情况下不会出现写错误，这里暂时忽略
-        //                 LOG(ERR) << "SimpleRedisClient::execute() failed";
-        //                 return;
-        //             }
-        //         },
-        //         std::make_shared<std::string>(std::move(cmd)));
-        //     clients[which_sock].promises.push(p);
-        // }
 
-        if (clients[which_sock].highLevel) {
+        auto p = std::make_shared<std::promise<RESPValue>>();
+
+        if (clients.empty() || connection_closed_.load(std::memory_order_acquire)) {
+            p->set_exception(std::make_exception_ptr(std::runtime_error("client is closed")));
+            return p;
+        }
+
+        std::size_t which_sock = std::hash<std::size_t>{}(++SimpleRedisClient::ClientImpl::counter) % clients.size();
+        if (clients[which_sock]->highLevel) {
             p->set_exception(std::make_exception_ptr(std::runtime_error("to many bytes to write")));
             return p;
         }
 
-        clients[which_sock].socket->asyncWriteOnce(
-            [p, this, which_sock](bool success) {
-                if (!success) {
-                    LOG(ERR) << "SimpleRedisClient::execute() failed";
-                    p->set_exception(std::make_exception_ptr(std::runtime_error("write error")));
-                } else { // 写失败不入队
-                    // 这里 一个socket会对应唯一的一个 epoll context, context 是单线程的，保证先写入的先调用回调
-                    clients[which_sock].promises.push(p);
-                }
-            },
-            std::move(cmd));
+        auto& conn = clients[which_sock];
+        while (!conn->registered) {}    // 没有注册前自旋等一下，很快，没必要阻塞
 
+        conn->postTask([conn, p, cmd = std::move(cmd)]() mutable {
+            if (conn->closing) {
+                p->set_exception(std::make_exception_ptr(std::runtime_error("connection is closing")));
+                return;
+            }
+            conn->socket->asyncWriteOnce([conn, p](bool success) {
+               if (!success) {
+                   LOG(ERR) << "SimpleRedisClient::execute() failed";
+                   p->set_exception(std::make_exception_ptr(std::runtime_error("write error")));
+               } else { // 写失败不入队
+                   // 这里 一个socket会对应唯一的一个 epoll context, context 是单线程的，保证先写入的先调用回调
+                   conn->promises.push(p);
+               }
+           },
+           std::move(cmd));
+        });
         return p;
     }
 

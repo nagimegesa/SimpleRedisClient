@@ -3,6 +3,7 @@
 #include <vector>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <thread>
 #include <memory>
 
@@ -10,6 +11,15 @@
 #include "socket/SocketManager.h"
 #include "context/EpollContext.h"
 #include "../../src/app/redis/redis.h"
+
+struct Scope : IEpollContextScope {
+    std::promise<bool> registered;
+    void onRegister(const std::shared_ptr<ISocket>& socket) override {
+        registered.set_value(true);
+    }
+    void onDestroy() override {
+    }
+};
 
 int main(int argc, char* argv[]) {
     int N = (argc > 1) ? std::stoi(argv[1]) : 1000000;
@@ -59,6 +69,11 @@ int main(int argc, char* argv[]) {
             std::atomic<int> write_success{0};
             std::atomic<int> write_fail{0};
             std::atomic<bool> all_done{false};
+
+            auto scope = std::make_shared<Scope>();
+            socket->registerScope(scope);
+
+            scope->registered.get_future().get(); // 阻塞等待到注册完成
 
             // 注册读回调
             context->registerAsyncRead(socket, [&](const std::string& buf, size_t size) -> size_t {
