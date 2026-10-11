@@ -42,10 +42,7 @@ int main() {
     socket->listen(ISocket::DEFAULT_BACKLOG);
 
     socket->asyncAccept([](const std::shared_ptr<ISocket>& client) {
-        if (auto c = std::static_pointer_cast<LinuxSocket>(client)) {
-            LOG(INFO) << "Client accept fd: " << c->getNative();
-        }
-
+        LOG(INFO) << "Client accept fd: " << c->getNative();
         client->registerScope(std::make_shared<Scope>());
     });
 
@@ -56,12 +53,5 @@ int main() {
         if (input == "exit") {
             break;
         }
-
-        socket->asyncWriteOnce([](bool success) {
-            // std::cout << success << std::endl;
-            if (!success) {
-                LOG(ERR) << "writeOnce failed";
-            }
-        }, input);
     }
 }

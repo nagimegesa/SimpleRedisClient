@@ -1,6 +1,6 @@
 # Simple Redis Client
 
-一个基于 C++20 的轻量级 Redis 客户端示例实现，包含 RESP 协议编解码、基于 epoll 的异步网络框架、定时器、线程池，以及一个带连接池和 pipeline 能力的高层客户端 `SimpleRedisClient`。在此之上还实现了一个基于 protobuf 与 Nacos 服务发现的 RPC 服务端 `RpcServer`，配套的 RPC 客户端见 [SimpleRpcClient](https://github.com/nagimegesa/SimpleRpcClient)。
+一个基于 C++20 的轻量级 Redis 客户端示例实现，包含 RESP 协议编解码、基于 epoll 的异步网络框架、定时器、线程池，以及一个带连接池和 pipeline 能力的高层客户端 `SimpleRedisClient`。在此之上还实现了一个基于 protobuf 的 RPC 服务端 `RpcServer`，支持非流式与流式两种调用，并可通过 Nacos 注册服务实例。
 
 ## 目录
 
@@ -12,16 +12,22 @@
   - [运行 RPC 服务端](#运行-rpc-服务端)
 - [Redis 客户端](#redis-客户端)
   - [RESP 协议](#resp-协议)
+  - [一次命令的往返](#一次命令的往返)
   - [高层客户端：交互式 Redis CLI](#高层客户端交互式-redis-cli)
   - [压测结果](#压测结果)
 - [RPC 服务端](#rpc-服务端)
+  - [组件架构](#组件架构)
   - [注册并暴露一个服务](#注册并暴露一个服务)
+  - [一次非流式请求](#一次非流式请求)
+  - [流式调用](#流式调用)
+  - [一次流式会话](#一次流式会话)
   - [RPC 协议](#rpc-协议)
   - [配套 RPC 客户端](#配套-rpc-客户端)
 - [网络框架与定时器](#网络框架与定时器)
   - [ECHO 服务器](#echo-服务器)
   - [定时器](#定时器)
 - [目录结构](#目录结构)
+  - [结构总览](#结构总览)
 - [构建目标](#构建目标)
 - [其他测试与基准结果](#测试与基准结果)
   - [线程池性能基准](#线程池性能基准)
@@ -35,7 +41,7 @@
 - **异步网络框架**：`EpollContext` 基于 Linux epoll 和 eventfd 实现多事件循环线程，非阻塞读写，自动处理分包与粘包。提供单次写和批量写接口，可以通过注册高低水位线实现背压。**目前仅支持 Linux / WSL2**，`WindowsSocket` 尚未实现。
 - **定时器**：`EpollContext::addTimer` 基于 `timerfd` 实现，支持 context 级别与 socket 级别两种注册方式。
 - **高层客户端**：`SimpleRedisClient` 内置 4 条连接，采用**线程局部轮询**策略：每个线程维护自己的计数器，依次将请求分发到各连接，无需加锁，适合多线程环境。
-- **RPC 服务端**：`RpcServer` 使用自定义二进制协议承载请求，请求转发到线程池执行，并支持向 Nacos 注册服务实例用于服务发现。
+- **RPC 服务端**：`RpcServer` 使用自定义二进制协议承载请求，支持**非流式（unary）与流式（stream）**两种调用，handler 转发到线程池执行，并可向 Nacos 注册服务实例用于服务发现（注册开关默认关闭，见[已知限制](#已知限制)）。
 - **线程池**：包含自旋锁、任务队列调度、结果回传与异常捕获。Utils里面简单实现了一套基于CAS和环形缓冲区的无锁队列。
 - **日志系统**：`Logger` 支持 DEBUG、INFO、WARNING、ERROR 四个级别。
 
@@ -80,11 +86,14 @@ Bye.
 
 ### 运行 RPC 服务端
 ```bash
-# 需要先启动 Nacos 默认地址为 127.0.0.1:8848，Nacos 不可用时仅跳过服务注册，本地直连不受影响
+# 直接运行即可：服务发现（Nacos，默认地址 127.0.0.1:8848）默认不启用，
+# 需要注册时在 RpcServerImpl 里打开 use_nacos；Nacos 不可用也只跳过注册，不影响本地直连
 ./cmake-build-release/rpc_server
 
-# 另开终端运行协议冒烟测试
+# 另开终端：协议冒烟 → 一致性 / 健壮性（36 用例）→ 指标压测
 python3 test/test_rpc/test_rpc_client.py
+python3 test/test_rpc/test_client_error.py
+python3 test/test_rpc/rpc_metrics.py
 ```
 
 ---
@@ -94,6 +103,15 @@ python3 test/test_rpc/test_rpc_client.py
 ### RESP 协议
 
 命令构建由 `buildRESPCommand` 完成，负责将参数列表拼接为 RESP 数组；响应解析由 `RESP_Parser` 完成，支持 Simple String、Error、Integer、Bulk String、Array、Null 六种类型。数据不足时解析器抛出 `IncompleteRESPException`，调用方捕获后继续等待后续数据，因此可以配合异步 read 回调处理粘包。
+
+### 一次命令的往返
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/redis-command-sequence-dark.svg">
+  <img alt="Redis 客户端一次命令的时序" src="docs/img/redis-command-sequence-light.svg">
+</picture>
+
+一次命令从 CLI 到 Redis 再回来的链路：`SimpleRedisClient` 按线程局部计数器从 4 条连接里选一条发出 RESP 命令，响应经 epoll 读回调交给 `RESP_Parser` 解析（分片时抛异常继续等），再格式化回 CLI。
 
 ### 高层客户端：交互式 Redis CLI
 
@@ -194,6 +212,15 @@ Peak utilization: 80.4%
 
 ## RPC 服务端
 
+### 组件架构
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/rpc-server-architecture-dark.svg">
+  <img alt="RPC 服务端组件架构" src="docs/img/rpc-server-architecture-light.svg">
+</picture>
+
+从客户端到网络层的总览：`RpcServer` 负责监听与 handler 注册表，每个连接对应一个 `RpcChannel`（流式会话在 `RpcSession` 里），帧的解析与构造在 `app/rpc/protocol/`，handler 由线程池执行，Nacos 注册默认关闭。
+
 ### 注册并暴露一个服务
 
 ```cpp
@@ -232,37 +259,99 @@ int main() {
 }
 ```
 
+### 一次非流式请求
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/unary-request-sequence-dark.svg">
+  <img alt="一次非流式请求的时序" src="docs/img/unary-request-sequence-light.svg">
+</picture>
+
+同一个连接上的请求是串行处理的：读回调把字节交给 `dispatch` 逐帧 `parse` 出 `RpcContext`，再转发线程池执行注册的 handler，最后 `buildResponse` 组帧写回；解析失败会回一个请求级错误帧并重新同步到下一帧起始。
+
+### 流式调用
+
+流式 handler 的入参与返回值都是 `AsyncGenerator`：每 `co_yield` 一次就是一条 `STREAM_RESPONSE`。客户端用从 1 开始逐帧递增的 `stream_id` 发 `STREAM_REQUEST`，最后发一帧 `STREAM_END` 关闭读通道。
+
+```cpp
+struct Hello : RpcService<Hello> {
+    void setup(RpcServer& server) override {
+        registerServiceName(server, "HelloService");
+        registerFunction(server, "hello", &Hello::hello);
+        registerStreamFunction(server, "helloStream", &Hello::helloStream);
+    }
+
+    // 每收到一帧请求就回一帧响应，客户端发 STREAM_END 后生成器自然结束
+    AsyncGenerator<HelloWorldResponse> helloStream(AsyncGenerator<HelloWorldRequest> req) {
+        while (auto r = co_await req.next()) {
+            HelloWorldResponse resp;
+            resp.set_res(r->msg());
+            co_yield resp;
+        }
+    }
+};
+```
+
+完整示例见 `src/rpc_server.cpp`；stream_id 递增规则、`STREAM_END` 与错误码见下一节。
+
+### 一次流式会话
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/stream-session-sequence-dark.svg">
+  <img alt="一次流式会话的时序" src="docs/img/stream-session-sequence-light.svg">
+</picture>
+
+首帧的 `STREAM_REQUEST` 建立 `RpcSession`，之后收流与发流各走一个 `Channel`：handler 从入参生成器逐帧取请求、每 `co_yield` 一次回一帧响应，`stream_id` 必须严格递增；收到 `STREAM_END` 后读通道关闭，服务端补一帧 `STREAM_END` 收尾。
+
 ### RPC 协议
 
-自定义二进制协议，整帧以 `0x0a 0x0b` 起始、以 `0x0b 0x0c` 结束，字段定义如下：
+自定义二进制协议，一帧由「起始 magic + 固定头 + 变长区 + 结束 magic」组成：
+
+```
+0x0a 0x0b | 固定头 22 字节 | service_name | func_name | param | 0x0b 0x0c
+```
+
+| 偏移 | 字段 | 长度 | 说明 |
+| --- | --- | --- | --- |
+| 0 | type | 1 | 1 = REQUEST，2 = RESPONSE，3 = STREAM_REQUEST，4 = STREAM_RESPONSE，5 = STREAM_END，255 = ERROR（服务端只会收到 1、3、5） |
+| 1 | request_id | 8 | 大端无符号，不能为 0，用于把响应与请求对应起来 |
+| 9 | stream_id | 8 | 大端无符号；非流式固定为 0，流式帧不能为 0 |
+| 17 | error_code | 1 | 请求固定为 0，响应携带错误码 |
+| 18 | service_len | 1 | 服务名长度，不超过 255 |
+| 19 | func_len | 1 | 函数名长度，不超过 255 |
+| 20 | param_len | 2 | 大端，报文体长度；错误响应与 `STREAM_END` 固定为 0 |
+
+变长区按固定顺序拼接，每个字段的长度都取自固定头：
 
 | 字段 | 长度 | 说明 |
 | --- | --- | --- |
-| type | 1 | 1 = REQUEST，2 = RESPONSE，3 = ERROR |
-| request_id | 8 | 大端无符号，不能为 0 |
-| error_code | 1 | 请求固定为 0，响应携带错误码 |
-| service_len | 1 | 服务名长度，不超过 255 |
-| service_name | 变长 | UTF-8 编码的服务名 |
-| func_len | 1 | 函数名长度，不超过 255 |
-| func_name | 变长 | UTF-8 编码的函数名 |
-| param_len | 4 | 大端，报文体字节数，错误响应固定为 0 |
-| param | 变长 | protobuf 序列化后的参数或返回值 |
+| service_name | service_len | UTF-8 编码的服务名 |
+| func_name | func_len | UTF-8 编码的函数名 |
+| param | param_len | protobuf 序列化后的参数或返回值 |
 
+流式调用的一轮交互：
+
+```
+STREAM_REQUEST(stream_id=1) ... STREAM_REQUEST(stream_id=n) STREAM_END(stream_id=n+1)
+        |                                                              |
+        +--> STREAM_RESPONSE(stream_id=1..n) --> STREAM_END(stream_id=n+1)
+```
 错误码定义：
 
 | 错误码 | 枚举 | 含义 |
 | --- | --- | --- |
-| 1 | `BAD_REQUEST` | 报文解析失败 |
-| 3 | `BAD_INTERNAL` | 服务端业务处理异常 |
-| 100 | `UNKNOWN_FUNCTION` | 服务名或函数名未注册 |
-| 101 | `UNKNOWN_PARAM` | 请求体反序列化失败 |
-| 102 | `UNKNOWN_RESPONSE` | 响应体序列化或解析失败 |
-
-`test/test_rpc/rpc_client.py` 是按上述协议写的 Python 客户端，只用于协议冒烟测试。
+| 0 | `ERR_BAD_INTERNAL` | 服务端内部异常 |
+| 1 | `ERR_BAD_REQUEST` | 报文解析失败或帧头非法 |
+| 2 | `ERR_BAD_STREAM_ID` | 流式帧的 stream_id 不合法（跳号、重复） |
+| 3 | `ERR_BAD_STREAM_TYPE` | 流式帧的 type 不合法（例如首帧就是 `STREAM_END`） |
+| 100 | `ERR_UNKNOWN_FUNCTION` | 服务名或函数名未注册 |
+| 101 | `ERR_UNKNOWN_PARAM` | 请求体反序列化失败 |
+| 102 | `ERR_UNKNOWN_RESPONSE` | 响应体序列化或解析失败 |
 
 ### 配套 RPC 客户端
 
-[SimpleRpcClient](https://github.com/nagimegesa/SimpleRpcClient) 是基于 Spring Boot 3 与 Netty 实现的完整客户端，与本项目的 `rpc_server` 共用同一套二进制协议，包含 Nacos 服务发现、单连接并发、分层重试与指标埋点等能力，具体用法与实现细节见该仓库的 README。
+本仓库该分支只包含服务端与 Python 协议测试脚本（见 [RPC 协议](#rpc-协议)），不含完整的客户端实现。
+
+[SimpleRpcClient](https://github.com/nagimegesa/SimpleRpcClient) 是基于 Spring Boot 3 与 Netty 实现的独立客户端项目，但是**只兼容main分支**，包含 Nacos 服务发现、单连接并发、分层重试与指标埋点等能力，具体用法与实现细节见该仓库的 README。
 
 ---
 
@@ -271,43 +360,49 @@ int main() {
 ### ECHO 服务器
 
 ```cpp
-#include <iostream>
-#include "context/EpollContext.h"
-#include "logger/Logger.h"
-#include "socket/LinuxSocket.h"
-#include "socket/SocketManager.h"
+struct Scope : IEpollContextScope {
+    void onRegister(const std::shared_ptr<ISocket>& socket) override {
+        socket->asyncRead( [socket](const std::string& buf, int size)->int {
+            if (size == 0) {
+                LOG(INFO) << "client closed write, try close socket";
+                socket->close();
+                return 0;
+            }
+            
+            socket->asyncWriteOnce([](bool success) {
+                if (!success) {
+                    LOG(ERR) << "writeOnce failed";
+                }
+            }, buf.substr(0, size));
+            return size;
+        });
+    }
+
+    void onDestroy() override {
+    }
+};
 
 int main() {
     Logger::getInstance().set_log_level(WARNING);
-
     auto context = std::make_shared<EpollContext>();
     auto socket = SocketManager::getInstance().getSocket(context);
 
     socket->bind("127.0.0.1", 8081);
     socket->listen(ISocket::DEFAULT_BACKLOG);
 
-    std::vector<std::shared_ptr<ISocket>> clients;
-
-    socket->asyncAccept([&clients](const std::shared_ptr<ISocket>& client) {
-        if (auto c = std::static_pointer_cast<LinuxSocket>(client)) {
-            LOG(INFO) << "Client accept fd: " << c->getNative();
-        }
-        clients.push_back(client);
-        client->asyncRead([client](const std::string& buf, int size) -> int {
-            if (size == 0) {
-                LOG(INFO) << "client closed write, close socket";
-                client->close();
-                return 0;
-            }
-            // ECHO 回显
-            client->asyncWriteOnce([](bool success) {
-                if (!success) LOG(ERR) << "writeOnce failed";
-            }, buf.substr(0, size));
-            return size;
-        });
+    socket->asyncAccept([](const std::shared_ptr<ISocket>& client) {
+        LOG(INFO) << "Client accept fd: " << c->getNative();
+        client->registerScope(std::make_shared<Scope>());
     });
 
-    context->run(true); // 阻塞运行
+    context->run();
+    std::string input;
+    while (true) {
+        std::getline(std::cin, input);
+        if (input == "exit") {
+            break;
+        }
+    }
 }
 ```
 
@@ -329,11 +424,21 @@ socket->addTimer(std::chrono::milliseconds(100), []() { LOG(INFO) << "timeout"; 
 
 ## 目录结构
 
+### 结构总览
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/project-overview-dark.svg">
+  <img alt="项目整体结构" src="docs/img/project-overview-light.svg">
+</picture>
+
+两个可执行入口（`redis_cli` / `rpc_server`）分别落在 `src/app/redis` 与 `src/app/rpc` 两个应用上，二者共用 `src/net` 的 socket 与事件循环、`src/utils` 的线程池与日志；示例 protobuf 在 `src/protoc/`，协议与各层测试在 `test/`。
+
 ```
 src/
   app/
       redis/     SimpleRedisClient、RESP 协议
       rpc/       RpcServer、RpcService、Nacos 服务注册
+        protocol/  RpcProtocol（帧格式、解析、构造）、RpcCodec（protobuf 载荷编解码）、RpcException
   net/
       context/   EpollContext，事件循环、定时器、读写调度
       socket/    SocketManager、ISocket、LinuxSocket（WindowsSocket 未实现）
@@ -346,7 +451,12 @@ src/
 test/
   test_net/             网络框架基本测试、定时器测试、Python echo 压测脚本
   test_queue/           无锁队列性能测试
-  test_rpc/             rpc server 的协议冒烟测试（Python 客户端）与多语言生成代码
+  test_rpc/             rpc server 的 Python 测试与多语言生成代码
+      rpc_client.py              协议常量、组帧 / 解帧、同步 / 异步客户端、统计工具（共用）
+      test_rpc_client.py         非流式 / 流式冒烟测试
+      test_client_error.py       协议一致性、错误码、TCP 分段与并发测试
+      rpc_metrics.py             QPS / 延迟 / 吞吐 / 并发 / 流式 / 错误路径指标测试
+      test_timer_cron.cpp        定时器与协程 Generator 配合的消费测试
   test_redis/
       test_redis_bench.cpp         epoll 异步 SET 压力测试，直接使用底层 socket 接口
       test_redis_client_bench.cpp  pipeline 压力测试
@@ -365,7 +475,7 @@ test/
 | 目标                        | 说明                                                                 |
 |---------------------------|--------------------------------------------------------------------|
 | `redis_cli`               | 交互式 Redis 客户端                                 |
-| `rpc_server`              | 示例 RPC 服务端，protobuf 编解码与 Nacos 服务注册                            |
+| `rpc_server`              | 示例 RPC 服务端（非流式 + 流式），protobuf 编解码与 Nacos 服务注册                    |
 | `test_redis_bench`        | SET 压力测试，连续 1,000,000 条 SET，和 test_redis_client_acc 区别是不走封装的client |
 | `test_redis_client_acc`   | pipeline 压力测试，连续 1,000,000 条 SET                                   |
 | `test_redis_acc`          | RESP 解析正确性与异步集成测试                                                  |
@@ -375,6 +485,7 @@ test/
 | `test_echo_server`        | 简单的EchoServer实现                                                    |
 | `test_timer`              | 定时器接口测试                                                            |
 | `test_nacos`              | Nacos 服务注册冒烟测试                                                      |
+| `test_timer_cron`         | 定时器与协程 Generator 配合的消费测试                                          |
 
 ---
 
@@ -398,7 +509,6 @@ Redis 客户端的压测数据见 [Redis 客户端 - 压测结果](#压测结果
 ### 当前限制
 - `SimpleRedisClient` **不维护客户端状态**，因此暂不支持 `MULTI`/`EXEC`、`SUBSCRIBE` 等需要上下文状态的命令。
 - 网络层目前仅支持 Linux / WSL2，无 Windows 原生支持，`WindowsSocket` 尚未实现。
-- `RpcServer` 目前只有服务端，仓库内仅提供 Python 协议冒烟测试，完整客户端见 [SimpleRpcClient](https://github.com/nagimegesa/SimpleRpcClient)；服务发现依赖 Nacos，Nacos 不可用时仅跳过注册，不影响本地直连。
 - ~~性能分析显示 `write` 系统调用和智能指针复制是主要瓶颈，有待进一步优化。~~
   1. write 的性能瓶颈集中在 postTask 函数中每一次提交任务都需要唤醒 epoll 线程，所以加入了一个变量判断是否已经唤醒线程，配合 writev，和扩大系统写缓冲区，将瓶颈减轻。
 - ~~目前性能分析显示，剩下的主要瓶颈在智能指针以及内存分配，write 的系统调用暂时没有想好怎么改。~~

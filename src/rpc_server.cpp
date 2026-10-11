@@ -34,7 +34,7 @@ struct Hello : RpcService<Hello> {
 };
 
 int main() {
-    Logger::getInstance().set_log_level(DEBUG);
+    Logger::getInstance().set_log_level(WARNING);
     RpcServer server;
     if (!server.bindAndListen("127.0.0.1", 8891)) {
         std::cout << "bind failed" << std::endl;
