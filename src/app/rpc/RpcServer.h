@@ -8,10 +8,14 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
+
 #include <google/protobuf/message.h>
 
 #include "corou/Generator.h"
 #include "socket/socket.h"
+#include "protocol/RpcCodec.h"
 
 /*
  * struct HelloRpc : public RpcService<HelloRpc> {
@@ -80,21 +84,6 @@ struct RpcServiceBase {
     virtual void setup(RpcServer& server) = 0;
 };
 
-class RpcException : public std::runtime_error {
-public:
-    explicit RpcException(const std::string& msg) : std::runtime_error(msg) {}
-};
-
-class RpcBadParamException : public RpcException {
-public:
-    explicit RpcBadParamException(const std::string& msg) : RpcException(msg) {}
-};
-
-class RpcBadResponseException : public RpcException {
-public:
-    explicit RpcBadResponseException(const std::string& msg) : RpcException(msg) {}
-};
-
 template<typename Derived>
 struct RpcService : RpcServiceBase {
 
@@ -106,16 +95,9 @@ struct RpcService : RpcServiceBase {
     void registerFunction(RpcServer& server, const std::string& name, Ret(Derived::*func)(Arg arg)) {
         server.addHandler(serviceName, name,
                           [func, this](const std::string& buffer) -> std::string {
-                              Arg req;
-                              if (!req.ParseFromString(buffer)) {
-                                  throw RpcBadParamException("bad parameters");
-                              }
-                              Ret         ret = (static_cast<Derived*>(this)->*func)(std::move(req));
-                              std::string out;
-                              if (!ret.SerializeToString(&out)) {
-                                  throw RpcBadResponseException("bad response");
-                              }
-                              return out;
+                              Arg req = rpc::RpcCodec::decode<Arg>(buffer);
+                              Ret ret = (static_cast<Derived*>(this)->*func)(std::move(req));
+                              return rpc::RpcCodec::encode(ret);
                           }
         );
     }
@@ -124,12 +106,8 @@ struct RpcService : RpcServiceBase {
     void registerFunction(RpcServer& server, const std::string& name, Ret(Derived::*func)()) {
         server.addHandler(serviceName, name,
                           [func, this](const std::string&) -> std::string {
-                              Ret         ret = (static_cast<Derived*>(this)->*func)();
-                              std::string out;
-                              if (!ret.SerializeToString(&out)) {
-                                  throw RpcBadResponseException("bad response");
-                              }
-                              return out;
+                              Ret ret = (static_cast<Derived*>(this)->*func)();
+                              return rpc::RpcCodec::encode(ret);
                           }
         );
     }
@@ -138,10 +116,7 @@ struct RpcService : RpcServiceBase {
     void registerFunction(RpcServer& server, const std::string& name, void(Derived::*func)(Arg arg)) {
         server.addHandler(serviceName, name,
                           [func, this](const std::string& buffer) -> std::string {
-                              Arg req;
-                              if (!req.ParseFromString(buffer)) {
-                                  throw RpcBadParamException("bad parameters");
-                              }
+                              Arg req = rpc::RpcCodec::decode<Arg>(buffer);
                               (static_cast<Derived*>(this)->*func)(std::move(req));
                               return "";
                           }
@@ -162,35 +137,13 @@ struct RpcService : RpcServiceBase {
     void registerStreamFunction(RpcServer& server, const std::string& name, AsyncGenerator<Ret>(Derived::*func)(AsyncGenerator<Arg>)) {
         server.addStreamHandler(serviceName, name,
                                 [func, this](AsyncGenerator<std::string> stringStream) -> AsyncGenerator<std::string> {
-                                    return t2StringStream(
+                                    return rpc::RpcCodec::encodeStream(
                                         (static_cast<Derived*>(this)->*func)(
-                                            stringStream2T<Arg>(std::move(stringStream))
+                                            rpc::RpcCodec::decodeStream<Arg>(std::move(stringStream))
                                         )
                                     );
                                 }
         );
-    }
-    
-    template <typename T>  requires std::is_base_of_v<::google::protobuf::Message, T>
-    AsyncGenerator<T> stringStream2T(AsyncGenerator<std::string> stringStream) {
-        while (auto n = co_await stringStream.next()) {
-            T req;
-            if (!req.ParseFromString(*n)) {
-                throw RpcBadParamException("bad parameters");
-            }
-            co_yield std::move(req);
-        }
-    }
-
-    template <typename T> requires std::is_base_of_v<::google::protobuf::Message, T>
-    AsyncGenerator<std::string> t2StringStream(AsyncGenerator<T> tStream) {
-        while (auto n = co_await tStream.next()) {
-            std::string resp;
-            if (!n->SerializeToString(&resp)) {
-                throw RpcBadResponseException("bad response");
-            }
-            co_yield std::move(resp);
-        }
     }
 
     static std::unique_ptr<Derived> create() {

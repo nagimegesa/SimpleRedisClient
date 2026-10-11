@@ -554,6 +554,8 @@ private:
                 conn->closing_callback(conn->socket);
             }
 
+            failAllPendingWrites(conn.get());
+
             conn->scope_->onDestroy(); // 通知上层进行销毁
 
 
@@ -562,9 +564,6 @@ private:
 
             // 从 epoll 中删除
             ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-
-            // 通知所有待写请求失败
-            failAllPendingWrites(conn.get());
 
             // 从 map 中移除, 这里可能会触发socket 析构，或者 conn 里面还有数据没写完，所以放在最后
             connections_.erase(conn->id);

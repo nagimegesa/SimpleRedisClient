@@ -6,6 +6,7 @@
 #define DEMO_WAITER_H
 
 #include <coroutine>
+#include <mutex>
 
 #include "context/EpollContext.h"
 #include <memory>
@@ -32,20 +33,46 @@ struct WriterWaiter {
     std::shared_ptr<ISocket> socket{};
     std::string data;
     bool writeResult = false;
-    bool await_ready() { return false; }
-    WriterWaiter(std::shared_ptr<ISocket> socket, std::string&& data) : socket(std::move(socket)), data(std::move(data)) {}
-    void await_suspend(std::coroutine_handle<> h) {
-        if (socket) {
-            socket->asyncWriteOnce([this, h](bool success) {
-                this->writeResult = success;
-                h.resume();
-            }, std::move(data));
-        } else {
-            h.resume();
+
+    mutable std::mutex mutex_;
+    bool               completed_ = false;
+    bool               suspended_ = false;
+
+    bool await_ready() const noexcept { return false; }
+
+    bool await_suspend(std::coroutine_handle<> h) {
+
+        if (!socket) {      // socket 有问题
+            return false;
         }
+
+        socket->asyncWriteOnce([this, h](bool success) {
+            std::unique_lock<std::mutex> lock(mutex_);
+
+            writeResult = success;
+            completed_ = true;
+
+            if (!suspended_) { // 虽然 socket是 shared_ptr, 但是不能保证 连接没有被关闭
+                return; // 如果连接关闭，会立刻回调 false，这个时候如果还没有挂起不能 resume
+            }
+
+            lock.unlock();
+            h.resume();
+        }, std::move(data));
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (completed_) {
+            return false; // 挂起前就写完了
+        }
+
+        suspended_ = true;
+        return true;
     }
 
-    bool await_resume() const noexcept {
+    bool await_resume() {
+        // 与回调里的写操作构成 happens-before，避免读到未同步的 writeResult
+        std::lock_guard<std::mutex> lock(mutex_);
         return writeResult;
     }
 };

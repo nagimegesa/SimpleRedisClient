@@ -96,6 +96,8 @@ struct SimpleRedisClient::ClientImpl {
             auto connection = std::make_shared<RedisConnection>(this, socket.get());
             socket->registerScope(connection);
             clients.emplace_back(connection);
+
+            while (!connection->registered) {}    // 没有注册前自旋等一下，很快，没必要阻塞
         }
 
         if (!res) {
@@ -186,7 +188,6 @@ struct SimpleRedisClient::ClientImpl {
         }
 
         auto& conn = clients[which_sock];
-        while (!conn->registered) {}    // 没有注册前自旋等一下，很快，没必要阻塞
 
         conn->postTask([conn, p, cmd = std::move(cmd)]() mutable {
             if (conn->closing) {
